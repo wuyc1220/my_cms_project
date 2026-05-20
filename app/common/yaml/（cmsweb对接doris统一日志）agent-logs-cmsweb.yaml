@@ -1,0 +1,230 @@
+apiVersion: ezmon.zte.com.cn/v1alpha1
+kind: LogsInstance
+metadata:
+  name: logsinstance-cmsweb-kafka
+  namespace: ezmon
+  labels:
+    agent: zte-agent-logs
+spec:
+  allNodes: true
+  podLogsNamespaceSelector: { }
+  podLogsSelector:
+    matchLabels:
+      instance: primary
+      devicetype: cmsweb-kafka
+  externalLabels:
+    devicetype: "cmsweb"
+
+  processes:
+    threads: 3
+    processors:
+      - bloblang: |
+          root = this.line.split("||").map_each(pair -> { pair.split("=").0: pair.split("=").1 }).fold({}, item -> item.tally.merge(item.value))
+          root.devicetype = this.labels.devicetype
+          root.deviceip = this.labels.host_ip
+          root.devicename = this.labels.pod_name
+          root.deviceid = this.labels.deviceid
+          root.filename = this.labels.filename
+          root.sourcelog = this.line
+          root.platformid = this.labels.platform
+          root.time = now().format_timestamp_strftime("%Y-%m-%d %H:%M:%S.%f")
+          root.p_hour = now().format_timestamp_strftime("%Y-%m-%d %H:00:00")
+
+      - bloblang: |
+          root.filepath = this.filename.split("/").slice(0, -1).join("/")
+          root.filename = this.filename.split("/").slice(-1).0
+          root.devicetype = this.devicetype
+          root.deviceip = this.deviceip
+          root.devicename = this.devicename
+          root.deviceid = this.deviceid
+          root.sourcelog = this.sourcelog
+          root.time = this.time
+          root.p_hour = this.p_hour
+          root.platformid = this.platformid
+  output:
+    fallback:
+      {{- include "kafka.config.iptv-other-log" . | nindent 6 }}
+      - drop: {}
+
+  metrics:
+    none: {}
+
+---
+apiVersion: ezmon.zte.com.cn/v1alpha1
+kind: PodLogs
+metadata:
+  labels:
+    instance: primary
+    devicetype: cmsweb-kafka
+    logtype: cmsweb-access-kafka
+  name: cmsweb-access-kafka
+  namespace: ezmon
+spec:
+  jobLabel: "cmsweb-access-kafka"
+  namespaceSelector:
+    matchNames:
+      - {{ .Values.global.bvsNamespace }}
+  selector:
+    matchLabels:
+      devicetype: cmsweb
+
+  relabelings:
+    - sourceLabels: [ __meta_kubernetes_pod_label_devicetype ]
+      regex: cmsweb
+      action: keep
+    - sourceLabels: [ __meta_kubernetes_pod_node_name ]
+      targetLabel: __host__
+    - sourceLabels: [__meta_kubernetes_pod_name]
+      action: replace
+      targetLabel: pod_name
+    - sourceLabels: [ pod_name ]
+      targetLabel: __path__
+      replacement: {{ .Values.global.logpath }}/$1/tomcat/log_access.log
+    - sourceLabels: [ __address__ ]
+      targetLabel: cluster_ip
+      regex: (^[^:]*):(.*)
+      replacement: $1
+    - sourceLabels: [ __meta_kubernetes_pod_name ]
+      targetLabel: deviceid
+      regex: (.*)
+      replacement: $1
+    - sourceLabels: [ __meta_kubernetes_pod_host_ip ]
+      targetLabel: host_ip
+    - sourceLabels: [__meta_kubernetes_pod_name]
+      targetLabel: platform
+      replacement: {{ .Values.global.platform }}
+
+---
+apiVersion: ezmon.zte.com.cn/v1alpha1
+kind: PodLogs
+metadata:
+  labels:
+    instance: primary
+    devicetype: cmsweb-kafka
+    logtype: cmsweb-error-kafka
+  name: cmsweb-error-kafka
+  namespace: ezmon
+spec:
+  jobLabel: "cmsweb-error-kafka"
+  namespaceSelector:
+    matchNames:
+      - {{ .Values.global.bvsNamespace }}
+  selector:
+    matchLabels:
+      devicetype: cmsweb
+
+  relabelings:
+    - sourceLabels: [ __meta_kubernetes_pod_label_devicetype ]
+      regex: cmsweb
+      action: keep
+    - sourceLabels: [ __meta_kubernetes_pod_node_name ]
+      targetLabel: __host__
+    - sourceLabels: [__meta_kubernetes_pod_name]
+      action: replace
+      targetLabel: pod_name
+    - sourceLabels: [ pod_name ]
+      targetLabel: __path__
+      replacement: {{ .Values.global.logpath }}/$1/tomcat/log_error.log
+    - sourceLabels: [ __address__ ]
+      targetLabel: cluster_ip
+      regex: (^[^:]*):(.*)
+      replacement: $1
+    - sourceLabels: [ __meta_kubernetes_pod_name ]
+      targetLabel: deviceid
+      regex: (.*)
+      replacement: $1
+    - sourceLabels: [ __meta_kubernetes_pod_host_ip ]
+      targetLabel: host_ip
+    - sourceLabels: [__meta_kubernetes_pod_name]
+      targetLabel: platform
+      replacement: {{ .Values.global.platform }}
+
+---
+apiVersion: ezmon.zte.com.cn/v1alpha1
+kind: PodLogs
+metadata:
+  labels:
+    instance: primary
+    devicetype: cmsweb-kafka
+    logtype: cmsweb-out-kafka
+  name: cmsweb-out-kafka
+  namespace: ezmon
+spec:
+  jobLabel: "cmsweb-out-kafka"
+  namespaceSelector:
+    matchNames:
+      - {{ .Values.global.bvsNamespace }}
+  selector:
+    matchLabels:
+      devicetype: cmsweb
+
+  relabelings:
+    - sourceLabels: [ __meta_kubernetes_pod_label_devicetype ]
+      regex: cmsweb
+      action: keep
+    - sourceLabels: [ __meta_kubernetes_pod_node_name ]
+      targetLabel: __host__
+    - sourceLabels: [__meta_kubernetes_pod_name]
+      action: replace
+      targetLabel: pod_name
+    - sourceLabels: [ pod_name ]
+      targetLabel: __path__
+      replacement: {{ .Values.global.logpath }}/$1/tomcat/log_out.log
+    - sourceLabels: [ __address__ ]
+      targetLabel: cluster_ip
+      regex: (^[^:]*):(.*)
+      replacement: $1
+    - sourceLabels: [ __meta_kubernetes_pod_name ]
+      targetLabel: deviceid
+      regex: (.*)
+      replacement: $1
+    - sourceLabels: [ __meta_kubernetes_pod_host_ip ]
+      targetLabel: host_ip
+    - sourceLabels: [__meta_kubernetes_pod_name]
+      targetLabel: platform
+      replacement: {{ .Values.global.platform }}
+
+---
+apiVersion: ezmon.zte.com.cn/v1alpha1
+kind: PodLogs
+metadata:
+  labels:
+    instance: primary
+    devicetype: cmsweb-kafka
+    logtype: cmsweb-sql-kafka
+  name: cmsweb-sql-kafka
+  namespace: ezmon
+spec:
+  jobLabel: "cmsweb-sql-kafka"
+  namespaceSelector:
+    matchNames:
+      - {{ .Values.global.bvsNamespace }}
+  selector:
+    matchLabels:
+      devicetype: cmsweb
+
+  relabelings:
+    - sourceLabels: [ __meta_kubernetes_pod_label_devicetype ]
+      regex: cmsweb
+      action: keep
+    - sourceLabels: [ __meta_kubernetes_pod_node_name ]
+      targetLabel: __host__
+    - sourceLabels: [__meta_kubernetes_pod_name]
+      action: replace
+      targetLabel: pod_name
+    - sourceLabels: [ pod_name ]
+      targetLabel: __path__
+      replacement: {{ .Values.global.logpath }}/$1/tomcat/log_sql.log
+    - sourceLabels: [ __address__ ]
+      targetLabel: cluster_ip
+      regex: (^[^:]*):(.*)
+      replacement: $1
+    - sourceLabels: [ __meta_kubernetes_pod_name ]
+      targetLabel: deviceid
+      regex: (.*)
+      replacement: $1
+    - sourceLabels: [ __meta_kubernetes_pod_host_ip ]
+      targetLabel: host_ip
+    - sourceLabels: [__meta_kubernetes_pod_name]
+      targetLabel: platform
+      replacement: {{ .Values.global.platform }}
