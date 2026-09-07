@@ -36,6 +36,7 @@ from sqlalchemy.sql import Select
 from sqlalchemy.sql.elements import ColumnElement
 
 from app.internal.cms_biz_system.models.content_auth import ContentAuth
+from app.internal.cms_biz_system.models.menu import Menu, RoleMenu
 from app.internal.cms_biz_system.models.user import Role, User, UserRole
 from app.internal.cms_biz_package.models.package import Content
 
@@ -43,12 +44,8 @@ from app.internal.cms_biz_package.models.package import Content
 # 预置 admin 角色 code（比较时统一大写）
 ADMIN_ROLE_CODE = "ADMIN"
 
-TASK_RELATED_MODULE_CODES = frozenset({
-    "task_completion_stats",
-    "task_status_count",
-    "task_assigned_table",
-    "not_assigned_tasks",
-})
+# 任务管理相关权限点 i18n_key（看板任务模块显隐：仅有 view 权限不显示，需 operate 权限）
+TASK_PERMISSION_KEYS = {"menu.business.tasks.operate"}
 
 
 # ─── 判定是否 admin ────────────────────────────────────────────────
@@ -101,6 +98,38 @@ async def has_task_assign_role(db: AsyncSession, user: Optional[User]) -> bool:
         )
     )
     return any(code and code.upper() == "TASK_ASSIGN" for (code,) in result.all())
+
+
+async def has_task_permission(db: AsyncSession, user: Optional[User]) -> bool:
+    """判断用户是否拥有看板任务模块可见权限（ADMIN 视为拥有）。
+
+    显隐口径：仅有 menu.business.tasks.view 不显示，
+    需拥有 menu.business.tasks.operate 才显示。
+    """
+    if await is_admin_user(db, user):
+        return True
+    if user is None or getattr(user, "id", None) is None:
+        return False
+
+    result = await db.execute(
+        select(Menu.i18n_key)
+        .join(RoleMenu, RoleMenu.menu_id == Menu.id)
+        .join(UserRole, UserRole.role_id == RoleMenu.role_id)
+        .join(Role, Role.id == UserRole.role_id)
+        .where(
+            UserRole.user_id == user.id,
+            UserRole.is_deleted.is_(False),
+            Role.is_deleted.is_(False),
+            Role.status == "active",
+            RoleMenu.is_deleted.is_(False),
+            Menu.is_deleted.is_(False),
+            Menu.status == "active",
+            Menu.menu_type == "permission",
+            Menu.i18n_key.in_(TASK_PERMISSION_KEYS),
+        )
+        .distinct()
+    )
+    return any(result.scalars().all())
 
 
 # ─── 获取当前用户角色 ID 集合 ──────────────────────────────────────

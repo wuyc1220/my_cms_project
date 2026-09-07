@@ -38,7 +38,7 @@ async def list_scheduled_tasks(
     sort_by: str | None = None,
     sort_order: str | None = None,
 ) -> PaginatedResponse[ScheduledTaskOut]:
-    query = select(ScheduledTask)
+    query = select(ScheduledTask).where(ScheduledTask.is_deleted.is_(False))
 
     if sort_by and sort_by in _SORT_FIELDS:
         col = getattr(ScheduledTask, sort_by)
@@ -100,7 +100,10 @@ async def list_scheduled_task_logs(
 
 async def get_scheduled_task_detail(db: AsyncSession, task_id: int) -> ScheduledTaskDetail:
     task = (
-        await db.execute(select(ScheduledTask).where(ScheduledTask.id == task_id))
+        await db.execute(select(ScheduledTask).where(
+            ScheduledTask.id == task_id,
+            ScheduledTask.is_deleted.is_(False)
+        ))
     ).scalar_one_or_none()
     if task is None:
         raise BusinessException(ErrorCode.SCHEDULED_TASK_NOT_FOUND, get_msg("SCHEDULED_TASK_NOT_FOUND"))
@@ -118,7 +121,7 @@ async def get_scheduled_task_detail(db: AsyncSession, task_id: int) -> Scheduled
         task_out = ScheduledTaskOut.model_validate(task)
     except Exception as exc:
         logger.exception(f"[ScheduledTaskDetail] 任务基本信息序列化失败 task_id={task_id}")
-        raise BusinessException(ErrorCode.INTERNAL_ERROR, f"Task serialization failed: {type(exc).__name__}: {exc}")
+        raise BusinessException(ErrorCode.INTERNAL_ERROR, get_msg("TASK_SERIALIZATION_FAILED", error=f"{type(exc).__name__}: {exc}"))
 
     # 逐条序列化日志，单条异常不影响其它日志展示
     log_outs: list[ScheduledTaskLogOut] = []
@@ -162,20 +165,23 @@ async def trigger_scheduled_tasks(
         return 0
 
     tasks = (
-        await db.execute(select(ScheduledTask).where(ScheduledTask.id.in_(ids)))
+        await db.execute(select(ScheduledTask).where(
+            ScheduledTask.id.in_(ids),
+            ScheduledTask.is_deleted.is_(False)
+        ))
     ).scalars().all()
 
     found_ids = {t.id for t in tasks}
     missing = [i for i in ids if i not in found_ids]
     if missing:
-        raise BusinessException(ErrorCode.SCHEDULED_TASK_IDS_NOT_FOUND, get_msg("SCHEDULED_TASK_IDS_NOT_FOUND"))
+        raise BusinessException(ErrorCode.SCHEDULED_TASK_IDS_NOT_FOUND, get_msg("SCHEDULED_TASK_IDS_NOT_FOUND", missing=missing))
 
     running = [t.task_type for t in tasks if t.execution_status == "running"]
     if running:
-        raise BusinessException(ErrorCode.SCHEDULED_TASK_RUNNING_BLOCKED, get_msg("SCHEDULED_TASK_RUNNING_BLOCKED"))
+        raise BusinessException(ErrorCode.SCHEDULED_TASK_RUNNING_BLOCKED, get_msg("SCHEDULED_TASK_RUNNING_BLOCKED", task_types=running))
     disabled = [t.task_type for t in tasks if t.schedule_status != "enabled"]
     if disabled:
-        raise BusinessException(ErrorCode.SCHEDULED_TASK_DISABLED_BLOCKED, get_msg("SCHEDULED_TASK_DISABLED_BLOCKED"))
+        raise BusinessException(ErrorCode.SCHEDULED_TASK_DISABLED_BLOCKED, get_msg("SCHEDULED_TASK_DISABLED_BLOCKED", task_types=disabled))
 
     # 延迟导入，避免循环依赖
     from app.jobs.scheduler import trigger_task_manual
@@ -186,3 +192,38 @@ async def trigger_scheduled_tasks(
         triggered += 1
 
     return triggered
+
+
+async def update_scheduled_task_cron(
+    db: AsyncSession,
+    task_id: int,
+    cron_expression: str,
+) -> ScheduledTask:
+    """
+    更新定时任务的 Cron 表达式。
+    
+    Args:
+        db: 数据库会话
+        task_id: 任务 ID
+        cron_expression: 新的 Cron 表达式
+    
+    Returns:
+        更新后的任务对象
+    """
+    task = await db.get(ScheduledTask, task_id)
+    if task is None:
+        raise BusinessException(ErrorCode.SCHEDULED_TASK_NOT_FOUND, get_msg("SCHEDULED_TASK_NOT_FOUND"))
+    
+    # 验证 Cron 表达式格式
+    from app.jobs.scheduler import _build_cron_trigger
+    try:
+        _build_cron_trigger(cron_expression)
+    except ValueError as e:
+        raise BusinessException(ErrorCode.VALIDATION_ERROR, get_msg("INVALID_CRON_EXPRESSION", error=e))
+    
+    task.cron_expression = cron_expression
+    await db.flush()
+    await db.refresh(task)
+    
+    logger.info(f"[ScheduledTask] 更新任务 {task.task_type} 的 Cron 表达式: {cron_expression}")
+    return task

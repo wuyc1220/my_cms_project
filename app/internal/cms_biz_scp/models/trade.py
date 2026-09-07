@@ -200,6 +200,7 @@ class ContractAttachment(Base):
     )
     file_name: Mapped[str] = mapped_column(String(500), nullable=False, comment="原始文件名")
     file_path: Mapped[str] = mapped_column(String(1000), nullable=False, comment="存储路径")
+    relative_path: Mapped[str | None] = mapped_column(String(1000), nullable=True, comment="文件相对路径，用于下载")
     file_size: Mapped[int | None] = mapped_column(Integer, nullable=True, comment="文件大小（字节）")
     uploaded_by: Mapped[int | None] = mapped_column(
         ForeignKey("cms_user.id", ondelete="SET NULL"), nullable=True

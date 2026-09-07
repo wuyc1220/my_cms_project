@@ -15,7 +15,8 @@
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ..models.trade import Contract, Provider
+from ..models.trade import Contract, License, LicenseContent, Provider
+from app.internal.cms_biz_package.models.task import Task
 from app.internal.cms_biz_system.models.user import User
 from app.internal.cms_biz_scp.schemas.trade import (
     ContractListItem,
@@ -124,7 +125,148 @@ async def _check_name_unique(db: AsyncSession, name: str, exclude_id: int | None
         query = query.where(Provider.id != exclude_id)
     # 使用 limit(1) 避免数据库中存在多条同名记录时报错
     if (await db.execute(query.limit(1))).scalar_one_or_none():
-        raise BusinessException(ErrorCode.PROVIDER_NAME_EXISTS, get_msg("PROVIDER_NAME_EXISTS"))
+        raise BusinessException(ErrorCode.PROVIDER_NAME_EXISTS, get_msg("PROVIDER_NAME_EXISTS", name=name))
+
+
+async def _sync_review_assignees_to_tasks(
+    db: AsyncSession,
+    provider_id: int,
+    old_l1: int | None,
+    new_l1: int | None,
+    old_l2: int | None,
+    new_l2: int | None,
+    old_l3: int | None,
+    new_l3: int | None,
+) -> None:
+    """
+    同步供应商指派人变更到关联内容的未分配审核任务。
+
+    规则：
+    - 仅当指派人 ID 实际变化时触发同步
+    - 仅更新 task_status='Not Assigned' 且 assignee_id IS NULL 的审核任务
+    - 不覆盖已有指派人的任务（包括 Pending 状态）
+    - 不处理 content_auth 数据权限同步
+    - 同步更新关联 ContentProcess 的 assigned 字段
+
+    链路：Provider → Contract → License → LicenseContent → Content → Task
+    """
+    # 收集需要同步的层级（仅在 ID 实际变化时）
+    sync_map: dict[str, int | None] = {}
+    if old_l1 != new_l1:
+        sync_map["review L1"] = new_l1
+    if old_l2 != new_l2:
+        sync_map["review L2"] = new_l2
+    if old_l3 != new_l3:
+        sync_map["review L3"] = new_l3
+
+    if not sync_map:
+        return
+
+    # 1. 批量查询关联内容 ID：Provider → Contract → License → LicenseContent
+    contract_ids = (
+        await db.execute(
+            select(Contract.id).where(
+                Contract.provider_id == provider_id,
+                Contract.is_deleted.is_(False),
+            )
+        )
+    ).scalars().all()
+    if not contract_ids:
+        return
+
+    license_ids = (
+        await db.execute(
+            select(License.id).where(
+                License.contract_id.in_(contract_ids),
+                License.is_deleted.is_(False),
+            )
+        )
+    ).scalars().all()
+    if not license_ids:
+        return
+
+    content_ids = (
+        await db.execute(
+            select(LicenseContent.content_id).where(
+                LicenseContent.license_id.in_(license_ids),
+                LicenseContent.is_deleted.is_(False),
+            ).distinct()
+        )
+    ).scalars().all()
+    if not content_ids:
+        return
+
+    # 2. 批量查询未分配（Not Assigned + assignee_id IS NULL）的审核任务
+    task_types_to_sync = list(sync_map.keys())
+    tasks = (
+        await db.execute(
+            select(Task).where(
+                Task.content_id.in_(content_ids),
+                Task.task_type.in_(task_types_to_sync),
+                Task.task_status == "Not Assigned",
+                Task.assignee_id.is_(None),
+                Task.is_deleted.is_(False),
+            )
+        )
+    ).scalars().all()
+    if not tasks:
+        return
+
+    # 3. 批量查询新指派人的显示名称（避免 N+1）
+    new_assignee_ids = {aid for aid in sync_map.values() if aid is not None}
+    user_name_map: dict[int, str] = {}
+    if new_assignee_ids:
+        users = (
+            await db.execute(
+                select(User).where(
+                    User.id.in_(new_assignee_ids),
+                    User.is_deleted.is_(False),
+                )
+            )
+        ).scalars().all()
+        for u in users:
+            user_name_map[u.id] = f"{u.display_name or u.username}（{u.username}）"
+
+    # 4. 更新任务和关联的 ContentProcess（同步处理人显示）
+    # 局部导入避免模块级循环依赖
+    from app.internal.cms_biz_package.models.task import TaskHistory
+    from app.internal.cms_biz_package.repositories import task_repo
+    from app.internal.cms_biz_package.services.task_service import (
+        _ensure_content_auth,
+        _update_content_process_assigned,
+    )
+
+    updated_count = 0
+    for task in tasks:
+        new_assignee_id = sync_map.get(task.task_type)
+        if new_assignee_id is None:
+            # 指派人被清空，保持 Not Assigned 状态
+            continue
+        task.assignee_id = new_assignee_id
+        task.task_status = "Pending"
+        updated_count += 1
+        # 记录任务操作历史（与 assign_task 流程保持一致，processed_by 标记来源为供应商同步）
+        assignee_name = user_name_map.get(new_assignee_id)
+        await task_repo.add_task_history(
+            db,
+            TaskHistory(
+                task_id=task.id,
+                processed_type="Assign",
+                processed_by="ProviderSync",
+                previous_value="Assignee: ",
+                updated_value=f"Assignee: {assignee_name or ''}",
+            ),
+        )
+        # 同步数据权限：确保新审核人能查看该内容（_ensure_content_auth 内部已查重，不会重复插入）
+        await _ensure_content_auth(db, task.content_id, new_assignee_id)
+        # 同步流程记录的处理人显示
+        await _update_content_process_assigned(db, task.content_id, task.task_type, assignee_name)
+
+    if updated_count > 0:
+        logger.info(
+            "供应商指派人变更同步完成 | provider_id={} updated_tasks={}",
+            provider_id, updated_count,
+        )
 
 
 # ─── Provider CRUD ────────────────────────────────────────────────────
@@ -229,7 +371,7 @@ async def create_provider(db: AsyncSession, data: ProviderCreate) -> ProviderLis
             )
         ).scalar_one()
         if current_count >= limit:
-            raise BusinessException(ErrorCode.SUPPLIER_LIMIT_EXCEEDED, get_msg("SUPPLIER_LIMIT_EXCEEDED"))
+            raise BusinessException(ErrorCode.SUPPLIER_LIMIT_EXCEEDED, get_msg("SUPPLIER_LIMIT_EXCEEDED", limit=limit))
 
     # 校验名称不能仅包含空格
     if data.name and data.name.strip() == '':
@@ -276,10 +418,16 @@ async def update_provider(
     logger.info(f"update_provider 入参: provider_id={provider_id}, data={data}")
     provider = await _get_provider_or_404(db, provider_id)
 
+    # 记录指派人变更前的值（用于同步审核任务）
+    old_l1 = provider.l1_assignee_id
+    old_l2 = provider.l2_assignee_id
+    old_l3 = provider.l3_assignee_id
+
     if data.name is not None and data.name != provider.name:
         # 校验名称不能仅包含空格
         if data.name.strip() == '':
             raise BusinessException(
+                ErrorCode.PROVIDER_NAME_WHITESPACE,
                 get_msg("PROVIDER_NAME_WHITESPACE"),
             )
         await _check_name_unique(db, data.name, exclude_id=provider_id)
@@ -303,6 +451,14 @@ async def update_provider(
         provider.l3_assignee_id = data.l3_assignee_id
     if data.notes is not None:
         provider.notes = data.notes
+
+    # 同步指派人变更到关联内容的未分配审核任务（仅当指派人字段实际变化时触发）
+    await _sync_review_assignees_to_tasks(
+        db, provider_id,
+        old_l1, provider.l1_assignee_id,
+        old_l2, provider.l2_assignee_id,
+        old_l3, provider.l3_assignee_id,
+    )
 
     await db.commit()
     await db.refresh(provider)

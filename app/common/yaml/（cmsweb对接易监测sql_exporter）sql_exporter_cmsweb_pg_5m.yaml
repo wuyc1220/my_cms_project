@@ -3,143 +3,208 @@ jobs:
 - name: "bigvideoservice_sql_cmsweb_pg_5m"
   interval: '5m'
   connections:
-  - 'postgres://####:****@127.0.0.1:5432/postgres?sslmode=disable'
+  - 'postgres://jm_cms:P5t9gx$MKz@80.80.134.134:6789/zxin?sslmode=disable'
   startup_sql:
-  - 'SET lock_timeout = 1000'
-  - 'SET idle_in_transaction_session_timeout = 100'
+  - 'SET lock_timeout = ''1s'''
+  - 'SET idle_in_transaction_session_timeout = ''100ms'''
   queries:
-  - name: "cms_content_status_draft_total"
-    help: "Total number of draft contents"
+  - name: "cms_content_status_waiting_materials_total"
+    help: "Total number of contents waiting for materials"
     labels:
       - "devicetype"
+      - "cluster_name"
       - "pg_role"
     values:
       - "count"
     query: |
       SELECT concat('cms_db','_',inet_server_addr()) AS deviceid, 'cms_db' AS devicetype,
+        'cmsweb_pg_cluster' AS cluster_name,
         CASE WHEN pg_is_in_recovery() THEN 'slave' ELSE 'master' END AS pg_role,
         COUNT(*) AS count
-      FROM content WHERE status = 'Draft' AND is_deleted = false
+      FROM jm_cms.content WHERE status = 'WaitingForMaterials' AND is_deleted = false AND is_discarded = false
+
+  - name: "cms_content_status_in_progress_total"
+    help: "Total number of contents in progress"
+    labels:
+      - "devicetype"
+      - "cluster_name"
+      - "pg_role"
+    values:
+      - "count"
+    query: |
+      SELECT concat('cms_db','_',inet_server_addr()) AS deviceid, 'cms_db' AS devicetype,
+        'cmsweb_pg_cluster' AS cluster_name,
+        CASE WHEN pg_is_in_recovery() THEN 'slave' ELSE 'master' END AS pg_role,
+        COUNT(*) AS count
+      FROM jm_cms.content WHERE status = 'InProgress' AND is_deleted = false AND is_discarded = false
 
   - name: "cms_content_status_ready_total"
     help: "Total number of contents ready to publish"
     labels:
       - "devicetype"
+      - "cluster_name"
       - "pg_role"
     values:
       - "count"
     query: |
       SELECT concat('cms_db','_',inet_server_addr()) AS deviceid, 'cms_db' AS devicetype,
+        'cmsweb_pg_cluster' AS cluster_name,
         CASE WHEN pg_is_in_recovery() THEN 'slave' ELSE 'master' END AS pg_role,
         COUNT(*) AS count
-      FROM content WHERE status = 'ReadyToPublish' AND is_deleted = false
+      FROM jm_cms.content WHERE status = 'ReadyForPublish' AND is_deleted = false AND is_discarded = false
+
+  - name: "cms_content_status_publishing_total"
+    help: "Total number of contents being published"
+    labels:
+      - "devicetype"
+      - "cluster_name"
+      - "pg_role"
+    values:
+      - "count"
+    query: |
+      SELECT concat('cms_db','_',inet_server_addr()) AS deviceid, 'cms_db' AS devicetype,
+        'cmsweb_pg_cluster' AS cluster_name,
+        CASE WHEN pg_is_in_recovery() THEN 'slave' ELSE 'master' END AS pg_role,
+        COUNT(*) AS count
+      FROM jm_cms.content WHERE status = 'Publishing' AND is_deleted = false AND is_discarded = false
+
+  - name: "cms_content_status_publish_failed_total"
+    help: "Total number of contents that failed to publish"
+    labels:
+      - "devicetype"
+      - "cluster_name"
+      - "pg_role"
+    values:
+      - "count"
+    query: |
+      SELECT concat('cms_db','_',inet_server_addr()) AS deviceid, 'cms_db' AS devicetype,
+        'cmsweb_pg_cluster' AS cluster_name,
+        CASE WHEN pg_is_in_recovery() THEN 'slave' ELSE 'master' END AS pg_role,
+        COUNT(*) AS count
+      FROM jm_cms.content WHERE status = 'PublishFailed' AND is_deleted = false AND is_discarded = false
 
   - name: "cms_content_status_published_total"
     help: "Total number of published contents"
     labels:
       - "devicetype"
+      - "cluster_name"
       - "pg_role"
     values:
       - "count"
     query: |
       SELECT concat('cms_db','_',inet_server_addr()) AS deviceid, 'cms_db' AS devicetype,
+        'cmsweb_pg_cluster' AS cluster_name,
         CASE WHEN pg_is_in_recovery() THEN 'slave' ELSE 'master' END AS pg_role,
         COUNT(*) AS count
-      FROM content WHERE status = 'Published' AND is_deleted = false
+      FROM jm_cms.content WHERE status = 'Published' AND is_deleted = false AND is_discarded = false
 
   - name: "cms_content_status_no_license_total"
     help: "Total number of contents with no active license"
     labels:
       - "devicetype"
+      - "cluster_name"
       - "pg_role"
     values:
       - "count"
     query: |
       SELECT concat('cms_db','_',inet_server_addr()) AS deviceid, 'cms_db' AS devicetype,
+        'cmsweb_pg_cluster' AS cluster_name,
         CASE WHEN pg_is_in_recovery() THEN 'slave' ELSE 'master' END AS pg_role,
         COUNT(*) AS count
-      FROM content WHERE status = 'NoActiveLicense' AND is_deleted = false
+      FROM jm_cms.content WHERE status = 'NoActiveLicense' AND is_deleted = false AND is_discarded = false
 
   - name: "cms_content_status_closed_total"
     help: "Total number of closed contents"
     labels:
       - "devicetype"
+      - "cluster_name"
       - "pg_role"
     values:
       - "count"
     query: |
       SELECT concat('cms_db','_',inet_server_addr()) AS deviceid, 'cms_db' AS devicetype,
+        'cmsweb_pg_cluster' AS cluster_name,
         CASE WHEN pg_is_in_recovery() THEN 'slave' ELSE 'master' END AS pg_role,
         COUNT(*) AS count
-      FROM content WHERE status = 'Closed' AND is_deleted = false
+      FROM jm_cms.content WHERE status = 'Closed' AND is_deleted = false AND is_discarded = false
 
   - name: "cms_publish_task_status_total"
     help: "Total number of publish tasks by status"
     labels:
       - "devicetype"
+      - "cluster_name"
       - "task_status"
       - "pg_role"
     values:
       - "count"
     query: |
       SELECT concat('cms_db','_',inet_server_addr()) AS deviceid, 'cms_db' AS devicetype,
+        'cmsweb_pg_cluster' AS cluster_name,
         CASE WHEN pg_is_in_recovery() THEN 'slave' ELSE 'master' END AS pg_role,
         status AS task_status, COUNT(*) AS count
-      FROM publish_task WHERE is_deleted = false
+      FROM jm_cms.publish_task WHERE is_deleted = false
       GROUP BY status
 
   - name: "cms_license_expired_total"
     help: "Total number of expired licenses"
     labels:
       - "devicetype"
+      - "cluster_name"
       - "pg_role"
     values:
       - "count"
     query: |
       SELECT concat('cms_db','_',inet_server_addr()) AS deviceid, 'cms_db' AS devicetype,
+        'cmsweb_pg_cluster' AS cluster_name,
         CASE WHEN pg_is_in_recovery() THEN 'slave' ELSE 'master' END AS pg_role,
         COUNT(*) AS count
-      FROM license WHERE end_date < NOW() AND is_deleted = false
+      FROM jm_cms.license WHERE end_date < NOW() AND is_deleted = false
 
   - name: "cms_license_expiring_soon_total"
     help: "Total number of licenses expiring within 30 days"
     labels:
       - "devicetype"
+      - "cluster_name"
       - "pg_role"
     values:
       - "count"
     query: |
       SELECT concat('cms_db','_',inet_server_addr()) AS deviceid, 'cms_db' AS devicetype,
+        'cmsweb_pg_cluster' AS cluster_name,
         CASE WHEN pg_is_in_recovery() THEN 'slave' ELSE 'master' END AS pg_role,
         COUNT(*) AS count
-      FROM license WHERE end_date BETWEEN NOW() AND NOW() + INTERVAL '30 days' AND is_deleted = false
+      FROM jm_cms.license WHERE end_date BETWEEN NOW() AND NOW() + INTERVAL '30 days' AND is_deleted = false
 
   - name: "cms_ingest_status_total"
     help: "Total number of ingest records by status"
     labels:
       - "devicetype"
+      - "cluster_name"
       - "ingest_status"
       - "pg_role"
     values:
       - "count"
     query: |
       SELECT concat('cms_db','_',inet_server_addr()) AS deviceid, 'cms_db' AS devicetype,
+        'cmsweb_pg_cluster' AS cluster_name,
         CASE WHEN pg_is_in_recovery() THEN 'slave' ELSE 'master' END AS pg_role,
         status AS ingest_status, COUNT(*) AS count
-      FROM ingest_history WHERE is_deleted = false
+      FROM jm_cms.ingest_history WHERE is_deleted = false
       GROUP BY status
 
   - name: "cms_scheduled_task_execution_status_total"
     help: "Total number of scheduled tasks by execution status"
     labels:
       - "devicetype"
+      - "cluster_name"
       - "execution_status"
       - "pg_role"
     values:
       - "count"
     query: |
       SELECT concat('cms_db','_',inet_server_addr()) AS deviceid, 'cms_db' AS devicetype,
+        'cmsweb_pg_cluster' AS cluster_name,
         CASE WHEN pg_is_in_recovery() THEN 'slave' ELSE 'master' END AS pg_role,
         execution_status, COUNT(*) AS count
-      FROM scheduled_task WHERE is_deleted = false
+      FROM jm_cms.scheduled_task WHERE is_deleted = false
       GROUP BY execution_status

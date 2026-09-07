@@ -20,6 +20,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.internal.cms_biz_orchestration.services.storage import storage_service
 from app.soap.config import soap_settings
+from app.common.core.i18n import get_msg
+from app.config import app_tz
 
 from . import objects as obj_builders
 from .constants import (
@@ -30,7 +32,7 @@ from .constants import (
 )
 from .loader import BuildContext, load_build_context
 from .mappings import add_mapping
-from .strategy import decide_action, decide_action_with_history, is_published
+from .strategy import decide_action
 
 
 class ADIBuilder:
@@ -52,12 +54,10 @@ class ADIBuilder:
     # ═══════════════════════════════════════════════════════
     async def build_publish_xml(self, content_id: int) -> str:
         """
-        构建发布 XML（REGIST / UPDATE / SKIP）。
+        构建发布 XML（统一 REGIST）。
 
-        根据各对象的发布历史和变更状态自动选择 Action：
-            - 未发布过 → REGIST
-            - 已发布且有变更 → UPDATE
-            - 已发布且无变更 → SKIP（仅输出Mapping，不输出Object）
+        所有关联对象（含 Category）每次发布均全量输出 Object + Mapping，
+        无 SKIP 去重（与 Package 行为一致）。
         """
         return await self._build(content_id, is_unpublish=False)
 
@@ -76,22 +76,22 @@ class ADIBuilder:
         """
         将 XML 字符串上传到 SFTP 的 c2 目录。
 
-        文件名格式: ``adi_{entity_id}_{correlate_id_8}_{timestamp}.xml``
+        文件名格式: ``c2/YYYYMM/adi_{entity_id}_{correlate_id_8}_{timestamp}.xml``
 
-        :return: SFTP 相对路径（格式: c2/xxx.xml）
+        :return: SFTP 相对路径（格式: c2/YYYYMM/xxx.xml）
         """
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        short_cid = correlate_id.replace("-", "")[:8]
-        eid = entity_id if entity_id is not None else "na"
-        filename = f"adi_{eid}_{short_cid}_{ts}.xml"
+        from .file_utils import generate_c2_filename, upload_c2_xml
 
-        result = storage_service.save_file(
-            file_content=xml_str.encode("utf-8"),
-            filename=filename,
-            category="c2"
-        )
-        logger.info(f"ADI XML 已上传至 SFTP: {result['file_path']}")
-        return result["file_path"]
+        eid = entity_id if entity_id is not None else "na"
+
+        # 自定义文件名: YYYYMM/content_{entity_id}_{uuid8}_{timestamp_ms}.xml
+        now = datetime.now()
+        date_folder = now.strftime("%Y%m")
+        ts = now.strftime("%Y%m%d_%H%M%S") + f"_{now.microsecond // 1000:03d}"
+        short_uuid = uuid.uuid4().hex[:8]
+        filename = f"{date_folder}/content_{eid}_{short_uuid}_{ts}.xml"
+
+        return upload_c2_xml(xml_str, filename, storage_service)
 
     # ═══════════════════════════════════════════════════════
     # 内部构建流程
@@ -100,7 +100,7 @@ class ADIBuilder:
         """加载上下文 → 构建对象/映射 → 序列化"""
         ctx = await load_build_context(self.db, content_id)
         if ctx is None:
-            raise ValueError(f"Content 不存在或已删除: id={content_id}")
+            raise ValueError(get_msg("SOAP_CONTENT_NOT_FOUND", id=content_id))
 
         root = self._build_root()
         objects_el = SubElement(root, "Objects")
@@ -109,14 +109,14 @@ class ADIBuilder:
         ct = ctx.content.content_type
         if ct in ("MOVIE", "EPISODE"):
             await self._build_program_scope(ctx, objects_el, mappings_el, is_unpublish)
-        elif ct in ("SERIES", "SEASON"):
+        elif ct in ("SERIES", "SEASON_SERIES", "SEASON"):
             await self._build_series_scope(ctx, objects_el, mappings_el, is_unpublish)
         elif ct == "CHANNEL":
             await self._build_channel_scope(ctx, objects_el, mappings_el, is_unpublish)
         elif ct == "SCHEDULE":
             await self._build_schedule_scope(ctx, objects_el, mappings_el, is_unpublish)
         else:
-            raise ValueError(f"不支持的 content_type: {ct}")
+            raise ValueError(get_msg("SOAP_UNSUPPORTED_CONTENT_TYPE", ct=ct))
 
         await self._attach_common_mappings(ctx, objects_el, mappings_el, is_unpublish)
 
@@ -138,7 +138,7 @@ class ADIBuilder:
         SubElement(header, "MsgID").text = str(uuid.uuid4())
         SubElement(header, "CSPID").text = soap_settings.csp_id
         SubElement(header, "LSPID").text = soap_settings.lsp_id
-        SubElement(header, "Timestamp").text = datetime.now().isoformat()
+        SubElement(header, "Timestamp").text = datetime.now(app_tz).replace(tzinfo=None).isoformat()
         return root
 
     # ─────────────────────────────────────────────────────
@@ -156,7 +156,7 @@ class ADIBuilder:
 
         XML 包含对象：
             - Program 主体（必定）
-            - Movie 列表（全部 REGIST / UPDATE / SKIP）
+            - Movie 列表（全部 REGIST）
             - Cast（先于 CastRoleMap）
             - CastRoleMap
         Mappings：
@@ -165,16 +165,9 @@ class ADIBuilder:
             - （如果是 EPISODE）父 SERIES → Program
         """
         content = ctx.content
+        program_action = decide_action(is_unpublish)
 
-        program_action = await decide_action_with_history(
-            self.db, "Content", content.id, content.id, is_unpublish,
-            obj_updated_at=content.updated_at,
-        )
-
-        if program_action is None:
-            program_action = Action.DELETE if is_unpublish else Action.REGIST
-
-        # 1. Program 主体（主对象不能SKIP，必须输出Object）
+        # 1. Program 主体
         objs.append(
             obj_builders.build_program_object(
                 content, ctx.program_meta, program_action,
@@ -183,7 +176,6 @@ class ADIBuilder:
                 genre_i18n=ctx.genre_i18n,
                 content_type_name=ctx.content_type_name,
                 custom_fields=ctx.custom_fields,
-                custom_field_i18n=ctx.custom_field_i18n,
                 tag_names=ctx.tag_names,
                 tag_i18n=ctx.tag_i18n,
                 i18n_data=ctx.i18n_data,
@@ -193,27 +185,19 @@ class ADIBuilder:
         )
 
         # 2. Movies（关联对象不下架，下架时跳过）
-        map_action = Action.DELETE if is_unpublish else Action.REGIST
+        map_action = decide_action(is_unpublish)
         for movie in ctx.movies:
             if is_unpublish:
                 continue
 
-            movie_action = await decide_action_with_history(
-                self.db, "Movie", movie.id, content.id, is_unpublish=False,
-                obj_updated_at=movie.updated_at,
-            )
-            if movie_action is None:
-                movie_action = Action.REGIST
-
-            if movie_action != Action.SKIP:
-                movie_i18n = ctx.movie_i18n_data.get(movie.id)
-                objs.append(obj_builders.build_movie_object(
-                    movie, movie_action,
-                    i18n_data=movie_i18n,
-                    languages=ctx.languages,
-                    primary_language=ctx.primary_language,
-                    custom_fields=ctx.custom_fields,
-                ))
+            movie_i18n = ctx.movie_i18n_data.get(movie.id)
+            objs.append(obj_builders.build_movie_object(
+                movie, Action.REGIST,
+                i18n_data=movie_i18n,
+                languages=ctx.languages,
+                primary_language=ctx.primary_language,
+                custom_fields=ctx.movie_custom_fields.get(movie.id, {}),
+            ))
             add_mapping(
                 self._maps_list(maps),
                 ElementType.PROGRAM, content.id,
@@ -226,50 +210,36 @@ class ADIBuilder:
             if is_unpublish:
                 continue
 
-            cast_action = await decide_action_with_history(
-                self.db, "Cast", cast.id, content.id, is_unpublish=False,
-                obj_updated_at=cast.updated_at,
-            )
-            if cast_action is None:
-                cast_action = Action.REGIST
-
-            if cast_action != Action.SKIP:
-                cast_i18n = ctx.cast_i18n_data.get(cast.id)
-                objs.append(obj_builders.build_cast_object(
-                    cast, cast_action,
-                    i18n_data=cast_i18n,
-                    languages=ctx.languages,
-                    primary_language=ctx.primary_language,
-                    custom_fields=ctx.custom_fields,
-                ))
+            cast_i18n = ctx.cast_i18n_data.get(cast.id)
+            objs.append(obj_builders.build_cast_object(
+                cast, Action.REGIST,
+                i18n_data=cast_i18n,
+                languages=ctx.languages,
+                primary_language=ctx.primary_language,
+                custom_fields=ctx.cast_custom_fields.get(cast.id, {}),
+            ))
 
         for rm in ctx.cast_role_maps:
             if is_unpublish:
                 continue
 
-            rm_action = await decide_action_with_history(
-                self.db, "CastRoleMap", rm.map_id, content.id, is_unpublish=False,
-                obj_updated_at=rm.updated_at,
-            )
-            if rm_action is None:
-                rm_action = Action.REGIST
-
-            if rm_action != Action.SKIP:
-                objs.append(obj_builders.build_cast_role_map_object(rm, rm_action, custom_fields=ctx.custom_fields))
+            objs.append(obj_builders.build_cast_role_map_object(rm, Action.REGIST, custom_fields=ctx.cast_role_map_custom_fields.get(rm.map_id, {})))
             add_mapping(
                 self._maps_list(maps),
                 ElementType.PROGRAM, content.id,
                 ElementType.CAST_ROLE_MAP, rm.map_id,
-                Action.DELETE if is_unpublish else Action.REGIST,
+                decide_action(is_unpublish),
             )
 
         # 4. EPISODE 的父 SERIES → Program Mapping
         if content.content_type == "EPISODE" and content.parent_id:
+            ep_sequence = ctx.content.sequence
             add_mapping(
                 self._maps_list(maps),
                 ElementType.SERIES, content.parent_id,
                 ElementType.PROGRAM, content.id,
-                Action.DELETE if is_unpublish else Action.REGIST,
+                decide_action(is_unpublish),
+                sequence=ep_sequence,
             )
 
     # ─────────────────────────────────────────────────────
@@ -283,21 +253,16 @@ class ADIBuilder:
         is_unpublish: bool,
     ) -> None:
         """
-        Series 作用域：Series 主体 + 其下所有 Program/子 Series。
+        Series 作用域：Series 主体 + Movie + CastRoleMap + Cast + 子 Content Mapping。
 
         注意：子 Program 的 Movie/CastRoleMap 不在此处展开；
              它们在子 Program 自己的发布任务中处理。
+             但 Series 自身的 Movie（如片花/预告片）在此处输出。
         """
         content = ctx.content
+        series_action = decide_action(is_unpublish)
 
-        series_action = await decide_action_with_history(
-            self.db, "Content", content.id, content.id, is_unpublish,
-            obj_updated_at=content.updated_at,
-        )
-        if series_action is None:
-            series_action = Action.DELETE if is_unpublish else Action.REGIST
-
-        # 1. Series 主体（主对象不能SKIP）
+        # 1. Series 主体
         objs.append(
             obj_builders.build_series_object(
                 content, ctx.series_meta, series_action,
@@ -306,34 +271,26 @@ class ADIBuilder:
                 genre_i18n=ctx.genre_i18n,
                 content_type_name=ctx.content_type_name,
                 custom_fields=ctx.custom_fields,
-                custom_field_i18n=ctx.custom_field_i18n,
                 tag_names=ctx.tag_names,
                 tag_i18n=ctx.tag_i18n,
                 i18n_data=ctx.i18n_data,
                 languages=ctx.languages,
                 primary_language=ctx.primary_language,
+                children_count=len(ctx.children),
             )
         )
 
-        # 2. CastRoleMap（挂在 Series 上，关联对象下架时跳过）
+        # 2. CastRoleMap（关联对象下架时跳过）
         for rm in ctx.cast_role_maps:
             if is_unpublish:
                 continue
 
-            rm_action = await decide_action_with_history(
-                self.db, "CastRoleMap", rm.map_id, content.id, is_unpublish=False,
-                obj_updated_at=rm.updated_at,
-            )
-            if rm_action is None:
-                rm_action = Action.REGIST
-
-            if rm_action != Action.SKIP:
-                objs.append(obj_builders.build_cast_role_map_object(rm, rm_action, custom_fields=ctx.custom_fields))
+            objs.append(obj_builders.build_cast_role_map_object(rm, Action.REGIST, custom_fields=ctx.cast_role_map_custom_fields.get(rm.map_id, {})))
             add_mapping(
                 self._maps_list(maps),
                 ElementType.SERIES, content.id,
                 ElementType.CAST_ROLE_MAP, rm.map_id,
-                Action.DELETE if is_unpublish else Action.REGIST,
+                decide_action(is_unpublish),
             )
 
         # 3. 关联的 Cast（关联对象下架时跳过）
@@ -341,34 +298,47 @@ class ADIBuilder:
             if is_unpublish:
                 continue
 
-            cast_action = await decide_action_with_history(
-                self.db, "Cast", cast.id, content.id, is_unpublish=False,
-                obj_updated_at=cast.updated_at,
-            )
-            if cast_action is None:
-                cast_action = Action.REGIST
+            cast_i18n = ctx.cast_i18n_data.get(cast.id)
+            objs.append(obj_builders.build_cast_object(
+                cast, Action.REGIST,
+                i18n_data=cast_i18n,
+                languages=ctx.languages,
+                primary_language=ctx.primary_language,
+                custom_fields=ctx.cast_custom_fields.get(cast.id, {}),
+            ))
 
-            if cast_action != Action.SKIP:
-                cast_i18n = ctx.cast_i18n_data.get(cast.id)
-                objs.append(obj_builders.build_cast_object(
-                    cast, cast_action,
-                    i18n_data=cast_i18n,
-                    languages=ctx.languages,
-                    primary_language=ctx.primary_language,
-                    custom_fields=ctx.custom_fields,
-                ))
+        # 3.5 Series 自身的 Movie（如片花/预告片）
+        for movie in ctx.movies:
+            if is_unpublish:
+                continue
+
+            movie_i18n = ctx.movie_i18n_data.get(movie.id)
+            objs.append(obj_builders.build_movie_object(
+                movie, Action.REGIST,
+                i18n_data=movie_i18n,
+                languages=ctx.languages,
+                primary_language=ctx.primary_language,
+                custom_fields=ctx.movie_custom_fields.get(movie.id, {}),
+            ))
+            add_mapping(
+                self._maps_list(maps),
+                ElementType.SERIES, content.id,
+                ElementType.MOVIE, movie.id,
+                decide_action(is_unpublish),
+            )
 
         # 4. 子 Content Mapping（Series → 子 Program 或 Series → 子 Series）
-        for idx, child in enumerate(ctx.children, start=1):
+        for child in ctx.children:
             child_et = CONTENT_TYPE_TO_ELEMENT.get(child.content_type)
             if child_et is None:
                 continue
+            child_seq = child.sequence if child.content_type == "EPISODE" else child.series_ordinal
             add_mapping(
                 self._maps_list(maps),
                 ElementType.SERIES, content.id,
                 child_et, child.id,
-                Action.DELETE if is_unpublish else Action.REGIST,
-                sequence=idx,
+                decide_action(is_unpublish),
+                sequence=child_seq,
             )
 
     # ─────────────────────────────────────────────────────
@@ -382,18 +352,18 @@ class ADIBuilder:
         is_unpublish: bool,
     ) -> None:
         """
-        Channel 作用域：Channel 主体 + PhysicalChannel + Schedule 挂载。
+        Channel 作用域：Channel 主体 + PhysicalChannel 追加。
+
+        关键设计决策：
+        - PhysicalChannel / Schedule（节目单）与 Channel 的从属关系由各自 Object 内的
+          ChannelID 属性表达，**不再生成额外 Mapping**。
+        - 下架频道时，不会级联下架其下的节目单（Schedule），Schedule 需要单独下架。
+          因此无论发布还是下架，Channel 的 Mappings 中都不包含 Schedule。
         """
         content = ctx.content
+        channel_action = decide_action(is_unpublish)
 
-        channel_action = await decide_action_with_history(
-            self.db, "Content", content.id, content.id, is_unpublish,
-            obj_updated_at=content.updated_at,
-        )
-        if channel_action is None:
-            channel_action = Action.DELETE if is_unpublish else Action.REGIST
-
-        # 1. Channel 主体（主对象不能SKIP）
+        # 1. Channel 主体
         objs.append(
             obj_builders.build_channel_object(
                 content, ctx.channel_meta, channel_action,
@@ -404,6 +374,7 @@ class ADIBuilder:
                 languages=ctx.languages,
                 primary_language=ctx.primary_language,
                 pictures=ctx.pictures,
+                poster_size_mapping_types=ctx.poster_size_mapping_types,
             )
         )
 
@@ -412,38 +383,16 @@ class ADIBuilder:
             if is_unpublish:
                 continue
 
-            pc_action = await decide_action_with_history(
-                self.db, "PhysicalChannel", pc.id, content.id, is_unpublish=False,
-                obj_updated_at=pc.updated_at,
-            )
-            if pc_action is None:
-                pc_action = Action.REGIST
-
-            if pc_action != Action.SKIP:
-                objs.append(
-                    obj_builders.build_physical_channel_object(pc, channel_action, channel_type=ctx.channel_type, custom_fields=ctx.custom_fields)
+            objs.append(
+                obj_builders.build_physical_channel_object(
+                    pc, Action.REGIST,
+                    channel_type=ctx.channel_type,
+                    channel_name=content.title,
+                    channel_description=ctx.channel_meta.description if ctx.channel_meta else None,
+                    custom_fields=ctx.physical_channel_custom_fields.get(pc.id, {}),
                 )
-            add_mapping(
-                self._maps_list(maps),
-                ElementType.CHANNEL, content.id,
-                ElementType.PHYSICAL_CHANNEL, pc.id,
-                Action.DELETE if is_unpublish else Action.REGIST,
             )
 
-        # 3. 子 Schedule Mapping（不展开 Schedule 本体）
-        for child in ctx.children:
-            if child.content_type != "SCHEDULE":
-                continue
-            add_mapping(
-                self._maps_list(maps),
-                ElementType.CHANNEL, content.id,
-                ElementType.SCHEDULE, child.id,
-                Action.DELETE if is_unpublish else Action.REGIST,
-            )
-
-    # ─────────────────────────────────────────────────────
-    # 构建分支：SCHEDULE
-    # ─────────────────────────────────────────────────────
     async def _build_schedule_scope(
         self,
         ctx: BuildContext,
@@ -451,19 +400,14 @@ class ADIBuilder:
         maps: Element,
         is_unpublish: bool,
     ) -> None:
-        """Schedule 作用域：Schedule 主体 + 挂到父 Channel"""
+        """Schedule 作用域：Schedule 主体（与父 Channel 的关系由 ChannelID 属性表达）"""
         content = ctx.content
-
-        schedule_action = await decide_action_with_history(
-            self.db, "Content", content.id, content.id, is_unpublish,
-            obj_updated_at=content.updated_at,
-        )
-        if schedule_action is None:
-            schedule_action = Action.DELETE if is_unpublish else Action.REGIST
+        schedule_action = decide_action(is_unpublish)
 
         objs.append(
             obj_builders.build_schedule_object(
                 content, ctx.schedule_meta, schedule_action,
+                license_data=ctx.license_data,
                 channel_id=ctx.schedule_channel_id,
                 channel_code=ctx.schedule_channel_code,
                 genre_name=ctx.genre_name,
@@ -475,18 +419,12 @@ class ADIBuilder:
                 schedule_actor_i18n=ctx.schedule_actor_i18n,
                 schedule_director_i18n=ctx.schedule_director_i18n,
                 schedule_package_ids=ctx.schedule_package_ids,
+                series_package_ids=ctx.series_package_ids,
+                series_children_count=ctx.series_children_count,
                 pictures=ctx.pictures,
+                poster_size_mapping_types=ctx.poster_size_mapping_types,
             )
         )
-
-        # 父 Channel → Schedule Mapping
-        if content.parent_id:
-            add_mapping(
-                self._maps_list(maps),
-                ElementType.CHANNEL, content.parent_id,
-                ElementType.SCHEDULE, content.id,
-                Action.DELETE if is_unpublish else Action.REGIST,
-            )
 
     # ─────────────────────────────────────────────────────
     # 公共挂载：Category / Package / Picture
@@ -502,60 +440,42 @@ class ADIBuilder:
         为所有类型通用的 Mapping 挂载：
             - Category → 主体（Program/Series/Channel）
             - Package  → 主体（Program/Series）
-            - Picture  → 主体（Program/Series/Channel/Category/Cast）
-
-        其中 Category/Package/Picture 如果未注入，会同时输出 Object。
-        已注入且无变更的对象（SKIP）仅输出 Mapping，不输出 Object。
-        注意：这些关联对象在下架时跳过，不生成DELETE
+            - Picture  → 主体（Program/Series/Category/Cast，不含 Channel）
+        
+        关联对象在下架时跳过，不生成 DELETE。
+        发布时所有关联对象统一 REGIST，全量输出。
         """
         content = ctx.content
         main_et = CONTENT_TYPE_TO_ELEMENT.get(content.content_type)
         if main_et is None:
             return
 
-        map_action = Action.DELETE if is_unpublish else Action.REGIST
+        map_action = decide_action(is_unpublish)
 
         # ── Category（可挂 Program/Series/Channel，关联对象下架时跳过） ─────
-        for idx, cat in enumerate(ctx.categories, start=1):
+        # 与 Package 行为对齐：每次发布无条件全量输出 Object（无 SKIP 去重）
+        for idx, (cat, cat_sequence) in enumerate(ctx.categories, start=1):
             if is_unpublish:
                 continue
 
-            logger.info(
-                f"[Category #{cat.id}] 判断 Action | "
-                f"name={cat.name} | updated_at={cat.updated_at}"
-            )
-            
-            cat_action = await decide_action_with_history(
-                self.db, "Category", cat.id, content.id, is_unpublish=False,
-                obj_updated_at=cat.updated_at,
-            )
-            
-            logger.info(f"[Category #{cat.id}] Action 判断结果: {cat_action}")
-            
-            if cat_action is None:
-                cat_action = Action.REGIST
-                logger.warning(f"[Category #{cat.id}] Action 为 None，降级为 REGIST")
-
-            if cat_action != Action.SKIP:
-                logger.info(f"[Category #{cat.id}] 输出 Object，Action={cat_action}")
-                cat_i18n = ctx.category_i18n_data.get(cat.id)
-                objs.append(
-                    obj_builders.build_category_object(
-                        cat, cat_action,
-                        i18n_data=cat_i18n,
-                        languages=ctx.languages,
-                        primary_language=ctx.primary_language,
-                        custom_fields=ctx.custom_fields,
-                    )
+            cat_i18n = ctx.category_i18n_data.get(cat.id)
+            # bug 32017：PosterType 字段先保留传空，无需再从首张海报取 mapping_type；
+            # 待 C2 规范明确后，可在此重新收集 cat_pics 并传入 poster_type
+            objs.append(
+                obj_builders.build_category_object(
+                    cat, Action.REGIST,
+                    i18n_data=cat_i18n,
+                    languages=ctx.languages,
+                    primary_language=ctx.primary_language,
+                    custom_fields=ctx.category_custom_fields.get(cat.id, {}),
                 )
-            else:
-                logger.info(f"[Category #{cat.id}] SKIP，仅输出 Mapping")
+            )
             add_mapping(
                 self._maps_list(maps),
                 ElementType.CATEGORY, cat.id,
                 main_et, content.id,
                 map_action,
-                sequence=idx,
+                sequence=cat_sequence if cat_sequence is not None else idx,  # 优先使用数据库 sequence，为 None 时使用索引
                 licensing_window_start=ctx.license_data.get("licensing_window_start"),
                 licensing_window_end=ctx.license_data.get("licensing_window_end"),
             )
@@ -565,20 +485,12 @@ class ADIBuilder:
             if is_unpublish:
                 continue
 
-            pkg_action = await decide_action_with_history(
-                self.db, "Package", pkg.id, content.id, is_unpublish=False,
-                obj_updated_at=pkg.updated_at,
-            )
-            if pkg_action is None:
-                pkg_action = Action.REGIST
-
-            if pkg_action != Action.SKIP:
-                objs.append(
-                    obj_builders.build_package_object(
-                        pkg, pkg_action,
-                        custom_fields=ctx.custom_fields,
-                    )
+            objs.append(
+                obj_builders.build_package_object(
+                    pkg, Action.REGIST,
+                    custom_fields=ctx.package_custom_fields.get(pkg.id, {}),
                 )
+            )
             add_mapping(
                 self._maps_list(maps),
                 ElementType.PACKAGE, pkg.id,
@@ -587,27 +499,53 @@ class ADIBuilder:
             )
 
         # ── Picture（多态，按 entity_type 反查目标 ElementType，关联对象下架时跳过） ─
+        # 记录需要更新状态的海报
+        pictures_to_update = []
+        # 节目单/频道的海报已提前单独发布，不重复生成 Picture Object
+        is_schedule_or_channel = content.content_type in ("SCHEDULE", "CHANNEL")
+        
         for pic in ctx.pictures:
             if is_unpublish:
                 continue
 
-            pic_action = await decide_action_with_history(
-                self.db, "Picture", pic.id, content.id, is_unpublish=False,
-                obj_updated_at=pic.updated_at,
-            )
-            if pic_action is None:
-                pic_action = Action.REGIST
-
             pic_target_et = PICTURE_ENTITY_TYPE_TO_ELEMENT.get(pic.entity_type.lower(), main_et)
-            if pic_action != Action.SKIP:
-                poster_size_name = ctx.poster_size_names.get(pic.id)
-                objs.append(obj_builders.build_picture_object(pic, pic_action, poster_size_name=poster_size_name, custom_fields=ctx.custom_fields))
-            add_mapping(
-                self._maps_list(maps),
-                ElementType.PICTURE, pic.id,
-                pic_target_et,
-                pic.entity_id,
-                map_action,
+            poster_size_name = ctx.poster_size_names.get(pic.id)
+            if not is_schedule_or_channel:
+                objs.append(obj_builders.build_picture_object(
+                    pic, Action.REGIST, poster_size_name=poster_size_name,
+                    custom_fields=ctx.picture_custom_fields.get(pic.poster_size_id, {}),
+                ))
+            
+            # 记录需要更新状态的海报
+            pictures_to_update.append(pic)
+            
+            if pic_target_et != ElementType.CHANNEL:
+                pic_mapping_type = ctx.poster_size_mapping_types.get(pic.id)
+                add_mapping(
+                    self._maps_list(maps),
+                    ElementType.PICTURE, pic.id,
+                    pic_target_et,
+                    pic.entity_id,
+                    map_action,
+                    mapping_type=pic_mapping_type,
+                )
+        
+        # 更新海报的发布状态（设置为 processing，等待 SOAP 回调后更新为 success/failed）
+        # 节目单/频道发布时：不创建 ingest_history 记录，且已 success 的海报不更新状态
+        if pictures_to_update:
+            await self._update_pictures_ingest_status(
+                pictures_to_update, "processing",
+                create_history=not is_schedule_or_channel,
+                skip_if_success=is_schedule_or_channel,
+            )
+
+        # 更新关联 Cast 的发布状态为 processing（发布时；下架时跳过）
+        # 与 Picture 保持一致，等待 SOAP 回调后由 router 更新为 success/failure
+        if not is_unpublish and ctx.casts:
+            await self._update_casts_ingest_status(
+                ctx.casts, "processing",
+                create_history=not is_schedule_or_channel,
+                skip_if_success=is_schedule_or_channel,
             )
 
     # ─────────────────────────────────────────────────────
@@ -623,6 +561,129 @@ class ADIBuilder:
         """
         return maps_el  # type: ignore[return-value]
 
+    async def _update_pictures_ingest_status(
+        self,
+        pictures: list,
+        status: str,
+        xml_path: str | None = None,
+        correlate_id: str | None = None,
+        create_history: bool = True,
+        skip_if_success: bool = False,
+    ) -> None:
+        """
+        更新海报的注入状态。
+        同时更新 Picture 表的 ingest_status 字段，并可选创建 IngestHistory 记录保存详细信息。
+
+        Args:
+            pictures: 海报列表
+            status: 状态 (none/processing/success/failed)
+            xml_path: C2 XML 文件路径（可选）
+            correlate_id: SOAP 关联 ID（可选）
+            create_history: 是否创建 IngestHistory 记录（默认 True）
+            skip_if_success: 如果海报已经是 success 状态则跳过更新（用于节目单发布时不覆盖已发布海报状态）
+        """
+        from datetime import datetime, timezone
+        from sqlalchemy import update
+        from app.internal.cms_biz_metada.models.basic import Picture
+        from app.internal.cms_biz_orchestration.models.ingest_history import IngestHistory
+
+        current_time = datetime.now(timezone.utc)
+        
+        # 1. 更新 Picture 表的 ingest_status 字段
+        for pic in pictures:
+            if skip_if_success and getattr(pic, 'ingest_status', None) == "success":
+                continue
+            await self.db.execute(
+                update(Picture)
+                .where(Picture.id == pic.id)
+                .values(
+                    ingest_status=status,
+                    updated_at=current_time,
+                )
+            )
+        
+        # 2. 创建 IngestHistory 记录保存详细信息（仅在 processing 或最终状态时创建）
+        if create_history and status in ("processing", "success", "failed"):
+            for pic in pictures:
+                if skip_if_success and getattr(pic, 'ingest_status', None) == "success":
+                    continue
+                history = IngestHistory(
+                    entity_type="Picture",
+                    entity_id=pic.id,
+                    action="REGIST" if status in ("processing", "success") else "DELETE",
+                    status="processing" if status == "processing" else ("success" if status == "success" else "failure"),
+                    ingest_xml_path=xml_path,
+                    correlate_id=correlate_id,
+                    send_date=current_time,
+                )
+                self.db.add(history)
+        
+        await self.db.commit()
+        logger.info(f"已更新 {len(pictures)} 张海报的注入状态为: {status}，并创建了 IngestHistory 记录")
+
+    async def _update_casts_ingest_status(
+        self,
+        casts: list,
+        status: str,
+        xml_path: str | None = None,
+        correlate_id: str | None = None,
+        create_history: bool = True,
+        skip_if_success: bool = False,
+    ) -> None:
+        """
+        更新 Cast 的注入状态。
+
+        与 _update_pictures_ingest_status 行为一致，用于：
+            - 发布开始时写入 processing
+            - 由 router 在 SOAP 回调成功时更新为 success，失败时更新为 failure
+
+        Args:
+            casts: Cast 列表
+            status: 状态 (none/processing/success/failure)
+            xml_path: C2 XML 文件路径（可选）
+            correlate_id: SOAP 关联 ID（可选）
+            create_history: 是否创建 IngestHistory 记录（默认 True）
+            skip_if_success: 如果已经是 success 状态则跳过更新（用于节目单/频道发布时不覆盖已发布状态）
+        """
+        from datetime import datetime, timezone
+        from sqlalchemy import update
+        from app.internal.cms_biz_metada.models.basic import Cast
+        from app.internal.cms_biz_orchestration.models.ingest_history import IngestHistory
+
+        current_time = datetime.now(timezone.utc)
+
+        # 1. 更新 Cast 表的 ingest_status 字段
+        for cast in casts:
+            if skip_if_success and getattr(cast, 'ingest_status', None) == "success":
+                continue
+            await self.db.execute(
+                update(Cast)
+                .where(Cast.id == cast.id)
+                .values(
+                    ingest_status=status,
+                    updated_at=current_time,
+                )
+            )
+
+        # 2. 创建 IngestHistory 记录（仅在 processing 或最终状态时创建）
+        if create_history and status in ("processing", "success", "failure"):
+            for cast in casts:
+                if skip_if_success and getattr(cast, 'ingest_status', None) == "success":
+                    continue
+                history = IngestHistory(
+                    entity_type="Cast",
+                    entity_id=cast.id,
+                    action="REGIST" if status in ("processing", "success") else "DELETE",
+                    status=status,
+                    ingest_xml_path=xml_path,
+                    correlate_id=correlate_id,
+                    send_date=current_time,
+                )
+                self.db.add(history)
+
+        await self.db.commit()
+        logger.info(f"已更新 {len(casts)} 个 Cast 的注入状态为: {status}，并创建了 IngestHistory 记录")
+
 
 # ═══════════════════════════════════════════════════════════
 # 序列化工具
@@ -635,4 +696,6 @@ def _serialize(root: Element) -> str:
     """
     raw = tostring(root, encoding="utf-8")
     pretty = minidom.parseString(raw).toprettyxml(indent="  ", encoding="utf-8")
-    return pretty.decode("utf-8")
+    # bug 32017：Category 的 JumpCategoryCode / PosterType 保留传空，
+    # 需输出显式开闭标签
+    return obj_builders.expand_empty_properties(pretty.decode("utf-8"))

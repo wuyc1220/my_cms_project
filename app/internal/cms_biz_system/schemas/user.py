@@ -32,5 +32,6 @@ class UserInfo(BaseModel):
     display_name: str | None
     status: str
     role_codes: list[str] = []
+    force_change_password: bool = False
 
     model_config = {"from_attributes": True}

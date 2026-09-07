@@ -13,6 +13,7 @@ from typing import Optional
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.config import app_tz
+from app.internal.cms_biz_metada.schemas.basic import EntityFieldValueItem
 
 
 # ─── 频道管理 ─────────────────────────────────────────────────────────
@@ -25,7 +26,7 @@ class ChannelListItem(BaseModel):
         id                内容 id
         title             频道名称
         status            Ingest 状态
-        genre_id          题材 id
+        genre_ids         题材 id 列表
         genre_name        题材名称
         channel_number    频道号（来源 ChannelMetadata）
         language          频道语言数组（数据字典 Language code）
@@ -40,7 +41,7 @@ class ChannelListItem(BaseModel):
     id: int
     title: str
     status: str
-    genre_id: Optional[int] = None
+    genre_ids: Optional[list[int]] = None
     genre_name: Optional[str] = None
     channel_number: Optional[int] = None
     language: list[str] = []
@@ -51,6 +52,7 @@ class ChannelListItem(BaseModel):
     license_start: Optional[str] = None
     license_end: Optional[str] = None
     created_at: Optional[datetime] = None
+    is_discarded: bool = False
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -64,7 +66,7 @@ class ChannelDetailItem(BaseModel):
         title           频道名称
         content_type    内容类型（CHANNEL）
         status          Ingest 状态
-        genre_id        题材 id
+        genre_ids        题材 id 列表
         genre_name      题材名称
         package_names   关联服务包名称列表
         category_names  关联栏目名称列表
@@ -80,10 +82,11 @@ class ChannelDetailItem(BaseModel):
     title: str
     content_type: str = "CHANNEL"
     status: str
-    genre_id: Optional[int] = None
+    genre_ids: Optional[list[int]] = None
     genre_name: Optional[str] = None
     package_names: list[str] = []
     category_names: list[str] = []
+    custom_tag_names: list[str] = []
     provider_names: list[str] = []
     license_start: Optional[str] = None
     license_end: Optional[str] = None
@@ -101,10 +104,10 @@ class ChannelUpdate(BaseModel):
 
     字段：
         title       频道名称
-        genre_id    题材 id
+        genre_ids   题材 id 列表
     """
     title: Optional[str] = Field(None, max_length=100)
-    genre_id: Optional[int] = None
+    genre_ids: Optional[list[int]] = None
 
 
 # ─── 物理频道 ─────────────────────────────────────────────────────────────
@@ -139,8 +142,11 @@ class PhysicalChannelListItem(BaseModel):
     channel_number: Optional[int] = None
     status: bool = True
     mediaservice: Optional[str] = None
+    mediaservice_name: Optional[str] = None
     definition: Optional[str] = None
+    definition_name: Optional[str] = None
     videoencode: Optional[str] = None
+    videoencode_name: Optional[str] = None
     bitrate: Optional[str] = None
     deeplink_ch_url: Optional[str] = None
     shifttime: Optional[int] = None
@@ -175,6 +181,7 @@ class PhysicalChannelCreate(BaseModel):
         tstv_enable     TSTV启用
         cutv_enable     CUTVE启用
         encryption      加密
+        custom_fields   自定义字段值列表（可选，新增时一并保存）
     """
     name: Optional[str] = Field(None, max_length=100)
     channel_number: Optional[int] = None
@@ -183,13 +190,14 @@ class PhysicalChannelCreate(BaseModel):
     definition: Optional[str] = Field(None, max_length=100)
     videoencode: Optional[str] = Field(None, max_length=100)
     bitrate: Optional[str] = Field(None, max_length=100)
-    deeplink_ch_url: Optional[str] = Field(None, max_length=100)
+    deeplink_ch_url: Optional[str] = Field(None, max_length=200)
     shifttime: Optional[int] = 0
     tvod_save_time: Optional[int] = 0
     tvod_enable: Optional[bool] = False
     tstv_enable: Optional[bool] = False
     cutv_enable: Optional[bool] = False
     encryption: Optional[bool] = True
+    custom_fields: Optional[list["EntityFieldValueItem"]] = None
 
 
 # ─── 物理频道历史记录 ─────────────────────────────────────────────────────
@@ -244,7 +252,7 @@ class ContentPackageRef(BaseModel):
     """
     id: int
     name: str
-    package_type: str
+    package_type: Optional[str] = None
     allocated_at: Optional[datetime] = None
 
     model_config = ConfigDict(from_attributes=True)
@@ -312,6 +320,7 @@ class ScheduleListItem(BaseModel):
         archive_content_type 归档产物类型 MOVIE/EPISODE/SERIES/SEASON
         archive_published    归档产物是否已发布（status=Published）
         archive_scheduled_time 计划归档执行时间（mode=plan 时设置）
+        is_published       节目单本身的发布状态（object_publish_status.is_published）
         created_at      创建时间
     """
     id: int
@@ -327,7 +336,9 @@ class ScheduleListItem(BaseModel):
     archive_content_type: Optional[str] = None
     archive_published: bool = False
     archive_scheduled_time: Optional[datetime] = None
+    is_published: bool = False
     created_at: Optional[datetime] = None
+    is_discarded: bool = False
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -379,7 +390,7 @@ class ArchiveListItem(BaseModel):
         content_type      MOVIE/EPISODE/SEASON/SERIES
         title             节目名称
         status            Ingest 状态
-        genre_id          题材 id
+        genre_ids         题材 id 列表
         genre_name        题材名称
         type_name         类型名称（来自元数据表的 type_id 关联 ContentType）
         channel_name      归档来源频道名称
@@ -399,7 +410,7 @@ class ArchiveListItem(BaseModel):
     content_type: str
     title: str
     status: str
-    genre_id: Optional[int] = None
+    genre_ids: Optional[list[int]] = None
     genre_name: Optional[str] = None
     type_name: Optional[str] = None
     channel_name: Optional[str] = None
@@ -414,6 +425,7 @@ class ArchiveListItem(BaseModel):
     sequence: Optional[int] = None
     series_ordinal: Optional[int] = None
     created_at: Optional[datetime] = None
+    is_discarded: bool = False
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -425,14 +437,26 @@ class ArchiveListItem(BaseModel):
         return v
 
 
+class ScheduleImportError(BaseModel):
+    """节目单导入行级校验错误。"""
+    row: int
+    errors: list[str] = []
+
+
 class ScheduleImportConflict(BaseModel):
-    """节目单导入冲突项（频道 + 时间段冲突）。"""
+    """节目单导入冲突项（频道 + 时间段冲突）。
+
+    conflict_source: existing=与数据库已有节目冲突 / in_file=与本次文件内其他行冲突
+    conflict_row:    in_file 时指向文件内冲突的对方行号
+    """
     row: int
     channel_name: Optional[str] = None
     title: Optional[str] = None
     begin_time: Optional[str] = None
     end_time: Optional[str] = None
     conflict_ids: list[int] = []
+    conflict_source: str = "existing"
+    conflict_row: Optional[int] = None
 
 
 class ScheduleImportResult(BaseModel):
@@ -442,12 +466,16 @@ class ScheduleImportResult(BaseModel):
         total       数据总条数
         created     新增数量
         updated     更新数量
+        skipped     跳过数量（校验失败）
         conflicts   频道+时间段冲突明细（force=false 时返回；非空代表未提交）
+        errors      行级校验错误明细（频道不存在、字典值匹配不上等）
     """
     total: int = 0
     created: int = 0
     updated: int = 0
+    skipped: int = 0
     conflicts: list[ScheduleImportConflict] = []
+    errors: list[ScheduleImportError] = []
 
 
 # ─── 流程/日志 ───────────────────────────────────────────────────────────
@@ -475,6 +503,7 @@ class ProcessListItem(BaseModel):
     start_dt: Optional[datetime] = None
     end_dt: Optional[datetime] = None
     assigned: Optional[str] = None
+    assigned_display_name: Optional[str] = None
     processed_before: Optional[bool] = None
     info: Optional[str] = None
 
@@ -482,19 +511,10 @@ class ProcessListItem(BaseModel):
 
 
 class StatusLogListItem(BaseModel):
-    """
-    状态变更日志列表项。
-
-    字段：
-        id              日志 id
-        processed_at    处理时间
-        processed_by    处理人
-        before_status   变更前状态
-        after_status    变更后状态
-    """
     id: int
     processed_at: Optional[datetime] = None
     processed_by: Optional[str] = None
+    processed_by_display_name: Optional[str] = None
     before_status: Optional[str] = None
     after_status: Optional[str] = None
 
@@ -502,23 +522,10 @@ class StatusLogListItem(BaseModel):
 
 
 class ActivityLogListItem(BaseModel):
-    """
-    活动日志列表项。
-
-    字段：
-        id              日志 id
-        processed_at    处理时间
-        processed_by    处理人
-        processed_type  处理类型
-        details         详情
-        previous_value  变更前值
-        updated_value   变更后值
-        updated_value_json 原始变更后值
-        entity_type     实体类型
-    """
     id: int
     processed_at: Optional[datetime] = None
     processed_by: Optional[str] = None
+    processed_by_display_name: Optional[str] = None
     processed_type: Optional[str] = None
     details: Optional[str] = None
     previous_value: Optional[str] = None
@@ -595,6 +602,17 @@ class ArchiveRequest(BaseModel):
     schedule_id: int
     mode: str = "now"  # now / plan
     scheduled_time: Optional[datetime] = None
+    # 归档弹窗随传的元数据字段（mode=now 时可选）：
+    # 与归档在同一事务内落库，归档校验失败时整体回滚，避免状态被单独修改
+    series_type: Optional[int] = None
+    series_name: Optional[str] = None
+    series_id: Optional[str] = None
+    sequence: Optional[int] = None
+    series_ordinal: Optional[int] = None
+    show_name: Optional[str] = None
+    show_id: Optional[str] = None
+    program_id: Optional[str] = None
+    cutv_enable: Optional[bool] = None
 
 
 class ArchiveResponse(BaseModel):

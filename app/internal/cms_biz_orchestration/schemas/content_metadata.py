@@ -10,18 +10,73 @@ from typing import Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
+# PostgreSQL Integer（4 字节有符号）取值范围，超出会导致数据库写入溢出报 500
+INT32_MAX = 2147483647
+
 
 # ═══════════════════════════════════════════════════════════
 # 公共子结构
 # ═══════════════════════════════════════════════════════════
 
 class SectionInfoItem(BaseModel):
-    """章节信息单条记录。"""
-    type: int
-    action: int
-    tag: str
-    start: int
-    end: int
+    """章节信息单条记录。
+
+    标准格式为 int 编码（type: 1=intro/2=ad/3=chapter, action: 0=no skip/1=skip,
+    start/end: 秒数）；但存量数据中存在旧字符串格式（如 type='segment',
+    action='start', start='00:00:00'，来源为 Excel 导入 json.loads 原样入库），
+    读取时放宽兼容，避免元数据详情接口 model_validate 校验失败报 500；
+    前端展示有 String 兜底，重新编辑保存后会写回标准格式。
+    """
+    type: int | str
+    action: int | str
+    tag: str = ""
+    start: int | str
+    end: int | str
+
+
+# C2 规范取值：type 1=intro/2=ad/3=chapter，action 0=no skip/1=skip
+_SECTION_TYPE_VALUES = {1, 2, 3}
+_SECTION_ACTION_VALUES = {0, 1}
+
+
+def normalize_sections_info(raw) -> tuple[list[dict] | None, list[str]]:
+    """校验并归一化 Excel 导入解析出的 SectionsInfo JSON。
+
+    按 C2 规范校验：type ∈ {1,2,3}、action ∈ {0,1}、start/end 为非负整数秒、
+    tag 可选字符串；字符串形式的数字（C2 导出格式如 "1"）自动转为 int。
+    导入链路此前只做 json.loads 原样入库，字符串格式脏数据（如
+    type='segment'、start='00:00:00'）入库后会导致元数据详情接口校验失败报 500。
+
+    :param raw: json.loads 后的值（list 或其他）
+    :return: (归一化结果, 错误列表)；有错误时归一化结果为 None
+    """
+    errors: list[str] = []
+    if not isinstance(raw, list):
+        return None, ["SectionsInfo 格式错误，应为 JSON 数组"]
+    normalized: list[dict] = []
+    for idx, item in enumerate(raw):
+        if not isinstance(item, dict):
+            errors.append(f"SectionsInfo[{idx}] 应为 JSON 对象")
+            continue
+        entry: dict = {"tag": str(item.get("tag") or "")}
+        for field in ("type", "action", "start", "end"):
+            value = item.get(field)
+            try:
+                int_value = int(str(value).strip())
+            except (TypeError, ValueError):
+                errors.append(f"SectionsInfo[{idx}].{field} 应为整数，实际为 '{value}'")
+                continue
+            if field == "type" and int_value not in _SECTION_TYPE_VALUES:
+                errors.append(f"SectionsInfo[{idx}].type 应为 1(intro)/2(ad)/3(chapter)，实际为 {int_value}")
+            elif field == "action" and int_value not in _SECTION_ACTION_VALUES:
+                errors.append(f"SectionsInfo[{idx}].action 应为 0(no skip)/1(skip)，实际为 {int_value}")
+            elif field in ("start", "end") and int_value < 0:
+                errors.append(f"SectionsInfo[{idx}].{field} 不能为负数，实际为 {int_value}")
+            entry[field] = int_value
+        normalized.append(entry)
+    if errors:
+        return None, errors
+    return normalized, errors
 
 
 # ═══════════════════════════════════════════════════════════
@@ -31,8 +86,8 @@ class SectionInfoItem(BaseModel):
 class ContentMetadataBase(BaseModel):
     """Program 元数据基础字段（创建/更新共用）。"""
     name: str = Field(..., max_length=100)
-    # genre_id 用于校验，但不保存到元数据表（存储在 content 主表）
-    genre_id: int | None = None
+    # genre_ids 用于校验，但不保存到元数据表（存储在 content_genre 中间表）
+    genre_ids: Optional[list[int]] = None
     # 注意：custom_tag_ids 已移除，统一使用 content_custom_tag 中间表
     vod_type: Optional[list[str]] = None
     sort_name: Optional[str] = Field(None, max_length=100)
@@ -50,10 +105,10 @@ class ContentMetadataBase(BaseModel):
     audio_lang: Optional[list[str]] = None
     subtitle_lang: Optional[list[str]] = None
     studio: Optional[str] = Field(None, max_length=100)
-    cdr_id: str = Field(..., max_length=100)
+    cdr_id: Optional[str] = Field(None, max_length=100)
     series_flag: int = 0
-    begin_duration: Optional[int] = None
-    end_duration: Optional[int] = None
+    begin_duration: Optional[int] = Field(None, ge=0, le=INT32_MAX)
+    end_duration: Optional[int] = Field(None, ge=0, le=INT32_MAX)
     status_flag: bool = True
     keywords: Optional[list[str]] = None
     sections_info: Optional[list[SectionInfoItem]] = None
@@ -68,8 +123,8 @@ class ContentMetadataCreate(ContentMetadataBase):
 class ContentMetadataUpdate(BaseModel):
     """更新 Program 元数据请求体（所有字段可选）。"""
     name: Optional[str] = Field(None, max_length=100)
-    # genre_id 用于校验，但不保存到元数据表（存储在 content 主表）
-    genre_id: Optional[int] = None
+    # genre_ids 用于校验，但不保存到元数据表（存储在 content_genre 中间表）
+    genre_ids: Optional[list[int]] = None
     # 注意：custom_tag_ids 已移除，统一使用 content_custom_tag 中间表
     vod_type: Optional[list[str]] = None
     sort_name: Optional[str] = Field(None, max_length=100)
@@ -89,8 +144,8 @@ class ContentMetadataUpdate(BaseModel):
     studio: Optional[str] = Field(None, max_length=100)
     cdr_id: Optional[str] = Field(None, max_length=100)
     series_flag: Optional[int] = None
-    begin_duration: Optional[int] = None
-    end_duration: Optional[int] = None
+    begin_duration: Optional[int] = Field(None, ge=0, le=INT32_MAX)
+    end_duration: Optional[int] = Field(None, ge=0, le=INT32_MAX)
     status_flag: Optional[bool] = None
     keywords: Optional[list[str]] = None
     sections_info: Optional[list[SectionInfoItem]] = None
@@ -114,47 +169,8 @@ class ContentMetadataItem(ContentMetadataBase):
 class SeriesMetadataBase(BaseModel):
     """Series 元数据基础字段。"""
     name: str = Field(..., max_length=100)
-    # genre_id 用于校验，但不保存到元数据表（存储在 content 主表）
-    genre_id: int | None = None
-    # 注意：custom_tag_ids 已移除，统一使用 content_custom_tag 中间表
-    vod_type: Optional[list[str]] = None
-    sort_name: Optional[str] = Field(None, max_length=100)
-    original_name: Optional[str] = Field(None, max_length=100)
-    original_country: Optional[str] = Field(None, max_length=100)
-    short_title: Optional[str] = Field(None, max_length=100)
-    language: Optional[str] = None
-    release_year: Optional[int] = None
-    description: Optional[str] = Field(None, max_length=500)
-    type_id: Optional[int] = None
-    tag_ids: Optional[list[int]] = None
-    rating_level: Optional[str] = None
-    advice: Optional[list[str]] = None
-    rating: Optional[str] = None
-    audio_lang: Optional[list[str]] = None
-    subtitle_lang: Optional[list[str]] = None
-    studio: Optional[str] = Field(None, max_length=100)
-    cdr_id: str = Field(..., max_length=100)
-    begin_duration: Optional[int] = None
-    end_duration: Optional[int] = None
-    status_flag: bool = True
-    keywords: Optional[list[str]] = None
-    sections_info: Optional[list[SectionInfoItem]] = None
-    volume_count: Optional[int] = None
-    series_type: Optional[int] = None
-    series_ordinal: Optional[int] = None
-    show_id: Optional[int] = None
-
-
-class SeriesMetadataCreate(SeriesMetadataBase):
-    """创建 Series 元数据请求体。"""
-    content_id: int
-
-
-class SeriesMetadataUpdate(BaseModel):
-    """更新 Series 元数据请求体（所有字段可选）。"""
-    name: Optional[str] = Field(None, max_length=100)
-    # genre_id 用于校验，但不保存到元数据表（存储在 content 主表）
-    genre_id: Optional[int] = None
+    # genre_ids 用于校验，但不保存到元数据表（存储在 content_genre 中间表）
+    genre_ids: Optional[list[int]] = None
     # 注意：custom_tag_ids 已移除，统一使用 content_custom_tag 中间表
     vod_type: Optional[list[str]] = None
     sort_name: Optional[str] = Field(None, max_length=100)
@@ -173,10 +189,51 @@ class SeriesMetadataUpdate(BaseModel):
     subtitle_lang: Optional[list[str]] = None
     studio: Optional[str] = Field(None, max_length=100)
     cdr_id: Optional[str] = Field(None, max_length=100)
-    begin_duration: Optional[int] = None
-    end_duration: Optional[int] = None
+    begin_duration: Optional[int] = Field(None, ge=0, le=INT32_MAX)
+    end_duration: Optional[int] = Field(None, ge=0, le=INT32_MAX)
+    status_flag: bool = True
+    keywords: Optional[list[str]] = None
+    metalayout: str = "0"
+    sections_info: Optional[list[SectionInfoItem]] = None
+    volume_count: Optional[int] = None
+    series_type: Optional[int] = None
+    series_ordinal: Optional[int] = None
+    show_id: Optional[int] = None
+
+
+class SeriesMetadataCreate(SeriesMetadataBase):
+    """创建 Series 元数据请求体。"""
+    content_id: int
+
+
+class SeriesMetadataUpdate(BaseModel):
+    """更新 Series 元数据请求体（所有字段可选）。"""
+    name: Optional[str] = Field(None, max_length=100)
+    # genre_ids 用于校验，但不保存到元数据表（存储在 content_genre 中间表）
+    genre_ids: Optional[list[int]] = None
+    # 注意：custom_tag_ids 已移除，统一使用 content_custom_tag 中间表
+    vod_type: Optional[list[str]] = None
+    sort_name: Optional[str] = Field(None, max_length=100)
+    original_name: Optional[str] = Field(None, max_length=100)
+    original_country: Optional[str] = Field(None, max_length=100)
+    short_title: Optional[str] = Field(None, max_length=100)
+    language: Optional[str] = None
+    release_year: Optional[int] = None
+    description: Optional[str] = Field(None, max_length=500)
+    type_id: Optional[int] = None
+    tag_ids: Optional[list[int]] = None
+    rating_level: Optional[str] = None
+    advice: Optional[list[str]] = None
+    rating: Optional[str] = None
+    audio_lang: Optional[list[str]] = None
+    subtitle_lang: Optional[list[str]] = None
+    studio: Optional[str] = Field(None, max_length=100)
+    cdr_id: Optional[str] = Field(None, max_length=100)
+    begin_duration: Optional[int] = Field(None, ge=0, le=INT32_MAX)
+    end_duration: Optional[int] = Field(None, ge=0, le=INT32_MAX)
     status_flag: Optional[bool] = None
     keywords: Optional[list[str]] = None
+    metalayout: Optional[str] = None
     sections_info: Optional[list[SectionInfoItem]] = None
     volume_count: Optional[int] = None
     series_type: Optional[int] = None
@@ -205,9 +262,10 @@ class SeriesMetadataItem(SeriesMetadataBase):
 class ChannelMetadataBase(BaseModel):
     """Channel 元数据基础字段。"""
     name: str = Field(..., max_length=100)
-    # 注意：genre_id 已移除，统一使用 content.genre_id 作为单一数据源
+    # 注意：genre_id 已移除，统一使用 content_genre 中间表作为数据源
     # 注意：custom_tag_ids 已移除，统一使用 content_custom_tag 中间表
-    channel_number: Optional[int] = None
+    # channel_number 受 int32 范围约束，超限会导致数据库写入溢出报 500
+    channel_number: Optional[int] = Field(None, ge=0, le=INT32_MAX)
     description: Optional[str] = Field(None, max_length=500)
     channel_type: Optional[str] = Field(None, max_length=100)
     audio_type: Optional[str] = Field(None, max_length=100)
@@ -229,9 +287,10 @@ class ChannelMetadataCreate(ChannelMetadataBase):
 class ChannelMetadataUpdate(BaseModel):
     """更新 Channel 元数据请求体（所有字段可选）。"""
     name: Optional[str] = Field(None, max_length=100)
-    # 注意：genre_id 已移除，统一使用 content.genre_id 作为单一数据源
+    # 注意：genre_id 已移除，统一使用 content_genre 中间表作为数据源
     # 注意：custom_tag_ids 已移除，统一使用 content_custom_tag 中间表
-    channel_number: Optional[int] = None
+    # channel_number 受 int32 范围约束，超限会导致数据库写入溢出报 500
+    channel_number: Optional[int] = Field(None, ge=0, le=INT32_MAX)
     description: Optional[str] = Field(None, max_length=500)
     channel_type: Optional[str] = Field(None, max_length=100)
     audio_type: Optional[str] = Field(None, max_length=100)
@@ -262,7 +321,7 @@ class ChannelMetadataItem(ChannelMetadataBase):
 class ScheduleMetadataBase(BaseModel):
     """Schedule 元数据基础字段。"""
     name: str = Field(..., max_length=100)
-    # 注意：genre_id 已移除，统一使用 content.genre_id 作为单一数据源
+    # 注意：genre_id 已移除，统一使用 content_genre 中间表作为数据源
     # 注意：custom_tag_ids 已移除，统一使用 content_custom_tag 中间表
     # 注意：begin_time / end_time 已移除，统一使用 content 主表
     vod_type: Optional[list[str]] = None
@@ -308,7 +367,7 @@ class ScheduleMetadataCreate(ScheduleMetadataBase):
 class ScheduleMetadataUpdate(BaseModel):
     """更新 Schedule 元数据请求体（所有字段可选）。"""
     name: Optional[str] = Field(None, max_length=100)
-    # 注意：genre_id 已移除，统一使用 content.genre_id 作为单一数据源
+    # 注意：genre_id 已移除，统一使用 content_genre 中间表作为数据源
     # 注意：custom_tag_ids 已移除，统一使用 content_custom_tag 中间表
     # 注意：begin_time / end_time 已移除，统一使用 content 主表
     vod_type: Optional[list[str]] = None

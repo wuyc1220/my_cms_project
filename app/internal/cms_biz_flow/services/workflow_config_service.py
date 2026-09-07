@@ -272,7 +272,8 @@ async def create_new_version(db: AsyncSession, config_id: int, user_id: Optional
     existing_draft = await repo.get_draft_by_code(db, config.process_code)
     if existing_draft:
         raise BusinessException(
-            f"流程编码 {config.process_code} 已存在草稿版本 (v{existing_draft.version})，请先发布或删除后再创建新版本"
+            ErrorCode.WORKFLOW_CONFIG_DRAFT_EXISTS,
+            get_msg("WORKFLOW_CONFIG_DRAFT_EXISTS", code=config.process_code, version=existing_draft.version)
         )
 
     max_version = await repo.get_max_version_by_code(db, config.process_code)

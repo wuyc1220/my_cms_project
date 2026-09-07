@@ -60,6 +60,10 @@ class PublishPlanCreate(BaseModel):
     task_type: str = Field("publish", description="任务类型: publish/unpublish")
     execution_mode: str = Field(..., description="执行方式: now/plan")
     scheduled_time: Optional[datetime] = Field(None, description="计划执行时间")
+    cascade_ignore_status: bool = Field(
+        False,
+        description="级联发布时忽略子内容状态（发布管理入口传 True；内容详情入口默认 False）",
+    )
 
     @field_validator("scheduled_time", mode="before")
     @classmethod
@@ -73,6 +77,13 @@ class PublishPlanCreate(BaseModel):
     def _ensure_timezone(cls, v):
         if isinstance(v, datetime) and v.tzinfo is None:
             return v.replace(tzinfo=app_tz)
+        return v
+
+    @field_validator("scheduled_time", mode="after")
+    @classmethod
+    def _validate_future(cls, v):
+        if v is not None and v < datetime.now(app_tz):
+            raise ValueError("计划发布时间不能小于当前时间")
         return v
 
     model_config = {
@@ -111,6 +122,13 @@ class PublishPlanUpdate(BaseModel):
             return v.replace(tzinfo=app_tz)
         return v
 
+    @field_validator("scheduled_time", mode="after")
+    @classmethod
+    def _validate_future(cls, v):
+        if v is not None and v < datetime.now(app_tz):
+            raise ValueError("计划发布时间不能小于当前时间")
+        return v
+
 
 class PublishPlanResponse(BaseModel):
     """发布计划响应"""
@@ -126,6 +144,8 @@ class PublishPlanResponse(BaseModel):
     scheduled_time: Optional[datetime] = None
     status: str
     publish_status: str
+    publish_time: Optional[datetime] = None
+    unpublish_time: Optional[datetime] = None
     correlate_id: Optional[str] = None
     error_message: Optional[str] = None
     created_at: datetime
@@ -135,6 +155,15 @@ class PublishPlanResponse(BaseModel):
 # 批量操作
 # ═══════════════════════════════════════════════════════════
 
+class BatchPublishResultItem(BaseModel):
+    """批量发布单条结果"""
+    entity_id: int
+    entity_name: Optional[str] = None
+    success: bool
+    message: Optional[str] = None
+    data: Optional[PublishPlanResponse] = None
+
+
 class BatchPublishRequest(BaseModel):
     """批量发布/下架请求"""
     entity_ids: list[int] = Field(..., description="实体ID列表")
@@ -142,6 +171,10 @@ class BatchPublishRequest(BaseModel):
     task_type: str = Field(..., description="任务类型: publish/unpublish")
     execution_mode: str = Field(..., description="执行方式: now/plan")
     scheduled_time: Optional[datetime] = Field(None, description="计划执行时间")
+    cascade_ignore_status: bool = Field(
+        False,
+        description="级联发布时忽略子内容状态（发布管理入口传 True；内容详情入口默认 False）",
+    )
 
     @field_validator("scheduled_time", mode="before")
     @classmethod
@@ -182,3 +215,10 @@ class IngestHistoryQueryParams(BaseModel):
     entity_id: Optional[int] = None
     action: Optional[str] = None
     status: Optional[str] = None
+
+
+class ArchivePublishCheckResponse(BaseModel):
+    """归档产物发布状态预检查响应（节目单发布前预检）"""
+    can_publish: bool
+    archive_content_id: Optional[int] = None
+    message: Optional[str] = None

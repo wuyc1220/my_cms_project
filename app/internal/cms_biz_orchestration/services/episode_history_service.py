@@ -7,9 +7,11 @@
 - 支持按内容名称、操作类型、处理人筛选
 """
 
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.internal.cms_biz_orchestration.models.episode_history import EpisodeHistory
+from app.internal.cms_biz_system.models.user import User
 from app.internal.cms_biz_orchestration.schemas.episode_history import (
     EpisodeHistoryItem,
     EpisodeHistoryListResponse,
@@ -35,7 +37,7 @@ async def add_episode_history(
         parent_id: 父级内容 ID（SERIES/SEASON）
         content_id: 子内容 ID（EPISODE/SERIES）
         content_name: 内容名称
-        processed_by: 处理人用户名（格式：username(user_id)）
+        processed_by: 处理人用户名
         processed_type: 操作类型（Add/Delete）
         content_type: 内容类型（EPISODE/SERIES）
         series_ordinal: Series 序号（仅 SERIES 类型使用）
@@ -84,5 +86,20 @@ async def list_episode_history(
         processed_type=processed_type,
         processed_by=processed_by,
     )
-    items = [EpisodeHistoryItem.model_validate(h) for h in histories]
+
+    # 处理人账号直接按 created_by 查用户表获取，兼容旧数据 processed_by 带 id 后缀的存储格式
+    user_ids = {h.created_by for h in histories if h.created_by}
+    username_map: dict[int, str] = {}
+    if user_ids:
+        result = await db.execute(
+            select(User.id, User.username).where(User.id.in_(user_ids))
+        )
+        username_map = {uid: uname for uid, uname in result.all() if uname}
+
+    items = []
+    for h in histories:
+        item = EpisodeHistoryItem.model_validate(h)
+        if h.created_by and h.created_by in username_map:
+            item.processed_by = username_map[h.created_by]
+        items.append(item)
     return EpisodeHistoryListResponse(items=items, total=len(items))

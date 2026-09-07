@@ -1,11 +1,13 @@
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from loguru import logger
 
-from ..models.basic import CustomField, CustomFieldBelonging, CustomFieldOption
+from ..models.basic import CustomField, CustomFieldBelonging, CustomFieldOption, EntityFieldValue, EntityI18n
 from app.common.schemas import BatchDeleteRequest
 from app.internal.cms_biz_metada.schemas.basic import CustomFieldCreate, CustomFieldListItem, CustomFieldUpdate
 from app.common.core.i18n import get_msg
 from app.common.core.exceptions import NotFoundException, BusinessException, ErrorCode
+from app.internal.cms_biz_system.services.dict_service import get_multi_language_options
 
 async def list_custom_fields(
     db: AsyncSession,
@@ -82,27 +84,18 @@ def _validate_option_codes(options: list) -> None:
 
 
 async def create_custom_field(db: AsyncSession, data: CustomFieldCreate) -> CustomField:
-    existing_belonging_ids = (
+    existing = (
         await db.execute(
-            select(CustomFieldBelonging.custom_field_id)
-            .where(CustomFieldBelonging.belonging.in_(data.belongings))
-            .distinct()
-        )
-    ).scalars().all()
-    if existing_belonging_ids:
-        duplicate = (
-            await db.execute(
-                select(CustomField.id)
-                .where(
-                    CustomField.id.in_(existing_belonging_ids),
-                    CustomField.field_name == data.field_name,
-                    CustomField.is_deleted.is_(False),
-                )
-                .limit(1)
+            select(CustomField.id)
+            .where(
+                CustomField.field_name == data.field_name,
+                CustomField.is_deleted.is_(False),
             )
-        ).scalar_one_or_none()
-        if duplicate:
-            raise BusinessException(ErrorCode.CUSTOM_FIELD_NAME_EXISTS, get_msg("CUSTOM_FIELD_NAME_EXISTS"))
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if existing:
+        raise BusinessException(ErrorCode.CUSTOM_FIELD_NAME_EXISTS, get_msg("CUSTOM_FIELD_NAME_EXISTS"))
     _validate_option_codes(data.options)
     cf = CustomField(
         field_name=data.field_name,
@@ -128,34 +121,108 @@ async def create_custom_field(db: AsyncSession, data: CustomFieldCreate) -> Cust
     await db.refresh(cf)
     return cf
 
+async def _migrate_field_values_on_multi_language_change(
+    db: AsyncSession, cf: CustomField, new_multi_language: bool
+) -> None:
+    """
+    multi_language 开关切换时迁移存量字段值，保证存储轨道与字段定义一致。
+
+    多语言字段值存 entity_i18n（每语言一行），非多语言字段值存 entity_field_value。
+    若不迁移，切换开关后已有值将无法被读取（编辑/详情回显为空、C2 同步丢字段）。
+
+    - True→False：将 entity_i18n 存量值（默认语言优先，回退语言顺序第一个非空值）
+      迁移到 entity_field_value，并清理该字段全部 entity_i18n 行；
+    - False→True：将 entity_field_value 存量值复制到 entity_i18n 的所有语言，
+      并清理该字段全部 entity_field_value 行。
+
+    注意：先清理目标轨道旧数据再插入，保证迁移幂等（来回切换不产生重复行）。
+    """
+    lang_options = await get_multi_language_options(db)
+    languages = [opt.code for opt in lang_options] or ["en"]
+    default_lang = languages[0]
+
+    if new_multi_language:
+        # False→True：单值复制到所有语言
+        await db.execute(
+            EntityI18n.__table__.delete().where(EntityI18n.field_name == cf.field_code)
+        )
+        rows = (await db.execute(
+            select(EntityFieldValue).where(
+                EntityFieldValue.custom_field_id == cf.id,
+                EntityFieldValue.is_deleted.is_(False),
+            )
+        )).scalars().all()
+        for row in rows:
+            if not row.value:
+                continue
+            for lang in languages:
+                db.add(EntityI18n(
+                    entity_type=row.entity_type,
+                    entity_id=row.entity_id,
+                    language=lang,
+                    field_name=cf.field_code,
+                    value=row.value,
+                ))
+        await db.execute(
+            EntityFieldValue.__table__.delete().where(EntityFieldValue.custom_field_id == cf.id)
+        )
+        logger.info(
+            f"自定义字段 {cf.field_code}({cf.field_name}) 切换为多语言，已将 {len(rows)} 条单值迁移至各语言"
+        )
+    else:
+        # True→False：多语言值收敛为单值（默认语言优先，回退语言顺序第一个非空值）
+        await db.execute(
+            EntityFieldValue.__table__.delete().where(EntityFieldValue.custom_field_id == cf.id)
+        )
+        rows = (await db.execute(
+            select(EntityI18n).where(
+                EntityI18n.field_name == cf.field_code,
+                EntityI18n.is_deleted.is_(False),
+            )
+        )).scalars().all()
+        grouped: dict[tuple[str, int], dict[str, str]] = {}
+        for row in rows:
+            if not row.value:
+                continue
+            grouped.setdefault((row.entity_type, row.entity_id), {})[row.language] = row.value
+        for (entity_type, entity_id), lang_vals in grouped.items():
+            value = next((lang_vals[lang] for lang in languages if lang_vals.get(lang)), None)
+            if value is None:
+                value = next(iter(lang_vals.values()))
+            db.add(EntityFieldValue(
+                entity_type=entity_type,
+                entity_id=entity_id,
+                custom_field_id=cf.id,
+                value=value,
+            ))
+        await db.execute(
+            EntityI18n.__table__.delete().where(EntityI18n.field_name == cf.field_code)
+        )
+        logger.info(
+            f"自定义字段 {cf.field_code}({cf.field_name}) 切换为非多语言（默认语言 {default_lang}），"
+            f"已将 {len(grouped)} 个实体的多语言值迁移为单值"
+        )
+
+
 async def update_custom_field(db: AsyncSession, field_id: int, data: CustomFieldUpdate) -> CustomField:
     cf = await get_custom_field(db, field_id)
+    old_multi_language = cf.multi_language
     new_field_name = data.field_name if data.field_name is not None else cf.field_name
-    new_belongings = data.belongings if data.belongings is not None else (await _get_belongings(db, field_id))
 
-    if new_field_name != cf.field_name or (data.belongings is not None and set(data.belongings) != set(await _get_belongings(db, field_id))):
-        existing_belonging_ids = (
+    if new_field_name != cf.field_name:
+        existing = (
             await db.execute(
-                select(CustomFieldBelonging.custom_field_id)
-                .where(CustomFieldBelonging.belonging.in_(new_belongings))
-                .distinct()
-            )
-        ).scalars().all()
-        if existing_belonging_ids:
-            duplicate = (
-                await db.execute(
-                    select(CustomField.id)
-                    .where(
-                        CustomField.id.in_(existing_belonging_ids),
-                        CustomField.field_name == new_field_name,
-                        CustomField.id != field_id,
-                        CustomField.is_deleted.is_(False),
-                    )
-                    .limit(1)
+                select(CustomField.id)
+                .where(
+                    CustomField.field_name == new_field_name,
+                    CustomField.id != field_id,
+                    CustomField.is_deleted.is_(False),
                 )
-            ).scalar_one_or_none()
-            if duplicate:
-                raise BusinessException(ErrorCode.CUSTOM_FIELD_NAME_EXISTS, get_msg("CUSTOM_FIELD_NAME_EXISTS"))
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        if existing:
+            raise BusinessException(ErrorCode.CUSTOM_FIELD_NAME_EXISTS, get_msg("CUSTOM_FIELD_NAME_EXISTS"))
 
     if data.field_name is not None:
         cf.field_name = data.field_name
@@ -187,6 +254,10 @@ async def update_custom_field(db: AsyncSession, field_id: int, data: CustomField
                 names=opt.names,
                 sort_order=opt.sort_order if opt.sort_order else idx,
             ))
+
+    # multi_language 开关变化时，与字段定义更新在同一事务内迁移存量值，保证原子性
+    if data.multi_language is not None and data.multi_language != old_multi_language:
+        await _migrate_field_values_on_multi_language_change(db, cf, data.multi_language)
 
     await db.commit()
     await db.refresh(cf)

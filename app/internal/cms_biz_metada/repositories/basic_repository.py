@@ -2,7 +2,7 @@
 内容元数据模块 - 数据访问层
 封装 Cast / Category / ContentType / Genre / Tag / CustomField / PosterSize / EntityData 的 SQLAlchemy 操作
 """
-from sqlalchemy import func, select
+from sqlalchemy import cast, func, select, String
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.internal.cms_biz_metada.models.basic import (
@@ -28,13 +28,13 @@ async def get_cast_by_id(db: AsyncSession, cast_id: int) -> Cast | None:
 
 async def list_casts_query(
     db: AsyncSession, *, page: int = 1, page_size: int = 10,
-    cast_id: int | None = None, name: str | None = None,
+    cast_id: str | None = None, name: str | None = None,
     description: str | None = None, ingest_statuses: list[str] | None = None,
     sort_by: str | None = None, sort_order: str | None = None,
 ) -> tuple[list[Cast], int]:
     query = select(Cast).where(Cast.is_deleted.is_(False))
-    if cast_id is not None:
-        query = query.where(Cast.id == cast_id)
+    if cast_id:
+        query = query.where(cast(Cast.id, String).ilike(f"%{cast_id}%"))
     if name:
         query = query.where(Cast.name.ilike(f"%{name}%"))
     if description:

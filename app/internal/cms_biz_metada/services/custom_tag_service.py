@@ -14,16 +14,12 @@ async def list_custom_tags(
     page: int = 1,
     page_size: int = 10,
     name: str | None = None,
-    languages: list[str] | None = None,
     sort_by: str | None = None,
     sort_order: str | None = None,
 ) -> PaginatedResponse[CustomTagListItem]:
     query = select(CustomTag).where(CustomTag.is_deleted == False)
     if name:
         query = query.where(CustomTag.name.ilike(f"%{name}%"))
-
-    if languages:
-        query = query.where(CustomTag.language.in_(languages))
 
     # 动态排序
     if sort_by and sort_order:

@@ -228,7 +228,7 @@ async def _has_inprogress_tasks(db: AsyncSession, source_id: int) -> bool:
 async def _check_no_inprogress_tasks(db: AsyncSession, source_id: int, action: str) -> None:
     """校验数据源下不存在 InProgress 任务，否则抛出异常"""
     if await _has_inprogress_tasks(db, source_id):
-        raise BusinessException(ErrorCode.SOURCE_HAS_INPROGRESS_TASK, get_msg("SOURCE_HAS_INPROGRESS_TASK"))
+        raise BusinessException(ErrorCode.SOURCE_HAS_INPROGRESS_TASK, get_msg("SOURCE_HAS_INPROGRESS_TASK", action=action))
 
 
 async def get_enabled_sources_by_type(

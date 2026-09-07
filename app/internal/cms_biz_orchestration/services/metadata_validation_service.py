@@ -17,10 +17,12 @@ import re
 from typing import Any
 
 from loguru import logger
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.common.core.exceptions import BusinessException, ErrorCode
 from app.common.core.i18n import get_msg
+from app.internal.cms_biz_package.models.package import ContentGenre
 from app.internal.cms_biz_system.models.metadata_validation_rule import MetadataValidationRule
 from app.internal.cms_biz_system.services.metadata_validation_rule_service import (
     get_rules_by_entity_type,
@@ -30,6 +32,184 @@ from app.internal.cms_biz_system.services.metadata_validation_rule_service impor
 # ═══════════════════════════════════════════════════════════
 # 公共校验入口
 # ═══════════════════════════════════════════════════════════
+
+# content_type → 元数据实体类型映射（与前端弹框 * 必填字段口径对齐）
+_CONTENT_TYPE_TO_ENTITY: dict[str, str] = {
+    "MOVIE": "PROGRAM",
+    "EPISODE": "PROGRAM",
+    "SERIES": "SERIES",
+    "SEASON": "SERIES",
+    "SEASON_SERIES": "SERIES",
+    "CHANNEL": "CHANNEL",
+    "SCHEDULE": "SCHEDULE",
+}
+
+# 系统维护字段：不在元数据弹框中展示（无 * 标记），由创建/同步流程维护，
+# 不参与绿勾判定——用户无法在 UI 中补填这些字段
+_SYSTEM_MAINTAINED_FIELDS = {
+    "cdr_id", "volume_count", "series_type", "series_ordinal", "show_id", "series_flag",
+}
+
+
+async def check_metadata_complete(
+    db: AsyncSession,
+    content_id: int,
+    content_type: str,
+) -> tuple[bool, list[str]]:
+    """
+    实时检查指定内容的元数据必填字段是否全部存在。
+
+    与 validate_metadata 共用同一份必填规则（metadata_validation_rule 表，
+    即前端元数据弹框中带 * 的必填字段口径），用于节点状态绿勾/红叉判定：
+    - 元数据记录不存在 → 不完整
+    - 任一 mandatory 规则字段为空 → 不完整，返回缺失字段标签列表
+    - 条件必填（is_mandatory == "C"）按当前 content_type 判断是否需要必填
+
+    Returns:
+        (是否完整, 缺失字段标签列表)
+    """
+    entity_type = _CONTENT_TYPE_TO_ENTITY.get(content_type)
+    if entity_type is None:
+        # 非元数据内容类型，视为无需校验
+        return True, []
+
+    # 读取 DB 中的完整元数据（必填判定基于持久化数据）
+    from app.internal.cms_biz_orchestration.repositories import (
+        get_content_metadata_by_content_id,
+        get_series_metadata_by_content_id,
+        get_channel_metadata_by_content_id,
+        get_schedule_metadata_by_content_id,
+    )
+
+    if entity_type == 'PROGRAM':
+        existing_metadata = await get_content_metadata_by_content_id(db, content_id)
+    elif entity_type == 'SERIES':
+        existing_metadata = await get_series_metadata_by_content_id(db, content_id)
+    elif entity_type == 'CHANNEL':
+        existing_metadata = await get_channel_metadata_by_content_id(db, content_id)
+    else:
+        existing_metadata = await get_schedule_metadata_by_content_id(db, content_id)
+
+    if existing_metadata is None:
+        return False, ["metadata"]
+
+    data_dict: dict[str, Any] = {
+        k: v for k, v in existing_metadata.__dict__.items()
+        if not k.startswith('_') and k != 'id'
+    }
+
+    # genre_ids 存储在 content_genre 中间表，与 validate_metadata 同口径
+    genre_stmt = select(ContentGenre.genre_id).where(
+        ContentGenre.content_id == content_id,
+        ContentGenre.is_deleted.is_(False),
+    )
+    genre_ids = [r[0] for r in (await db.execute(genre_stmt)).all()]
+    if genre_ids:
+        data_dict['genre_ids'] = genre_ids
+        # 校验规则表中题材字段名为 genre_id（单数），提供别名保证规则可命中
+        data_dict.setdefault('genre_id', genre_ids)
+
+    missing: list[str] = []
+    # 可参与必填判定的字段 = 元数据表实际列 + genre 虚拟字段
+    from sqlalchemy import inspect as sa_inspect
+    meta_columns = {attr.key for attr in sa_inspect(existing_metadata).mapper.column_attrs}
+    valid_fields = meta_columns | {"genre_ids", "genre_id"}
+
+    for rule in await get_rules_by_entity_type(db, entity_type):
+        if rule.rule_type != "mandatory":
+            continue
+        if rule.field_name in _SYSTEM_MAINTAINED_FIELDS:
+            # 系统维护字段：不在弹框展示（无 *），由创建/同步流程保证，有意跳过
+            continue
+        if rule.field_name not in valid_fields:
+            # 规则字段不属于该实体元数据表（如 PROGRAM 的 series_id），
+            # 永远无法满足，跳过并告警（规则配置疑似过期）
+            logger.warning(
+                "必填规则字段 [{}] 不属于 {} 元数据表字段，跳过（规则配置疑似过期）",
+                rule.field_name, entity_type,
+            )
+            continue
+        field_value = _get_field_value(data_dict, rule.field_name)
+        error = _validate_mandatory(rule, field_value, data_dict, content_type)
+        if error:
+            missing.append(rule.description or rule.field_name)
+
+    # ── Custom Fields 必填校验（与元数据弹框 Custom Fields Tab 的 * 必填口径一致）──
+    # 必填自定义字段 = custom_field.mandatory=True 且归属当前内容类型（含 "all"）的字段；
+    # 普通字段值存 entity_field_value（entity_type="Content"），
+    # 多语言字段值存 entity_i18n（弹窗仅要求默认语言，此处任一语言有值即算已填，避免误红）。
+    # 注意：belonging 口径必须与元数据弹框 getCustomFields 的 belongings 过滤一致
+    # （program/series/channel/schedule + all）。Movie/Picture/Cast 等归属的自定义字段
+    # 由 MaterialsModal 等弹框存到各自实体（entity_type='Movie' 等），Content 层无任何
+    # 写入入口，若纳入此处会形成永远无法满足的必填条件，导致 Metadata 节点恒红叉。
+    _CONTENT_TYPE_TO_BELONGING = {
+        "MOVIE": ["program"],
+        "EPISODE": ["program"],
+        "SERIES": ["series"],
+        "SEASON": ["series"],
+        "SEASON_SERIES": ["series"],
+        "CHANNEL": ["channel"],
+        "SCHEDULE": ["schedule"],
+    }
+    belonging_values = _CONTENT_TYPE_TO_BELONGING.get(content_type, [content_type.lower()])
+    belonging_values.append("all")
+
+    from app.internal.cms_biz_metada.models.basic import CustomField, CustomFieldBelonging, EntityFieldValue, EntityI18n
+    cf_rows = (
+        await db.execute(
+            select(CustomField)
+            .join(CustomFieldBelonging, CustomFieldBelonging.custom_field_id == CustomField.id)
+            .where(
+                CustomField.mandatory.is_(True),
+                CustomField.is_deleted.is_(False),
+                CustomFieldBelonging.is_deleted.is_(False),
+                func.lower(CustomFieldBelonging.belonging).in_(belonging_values),
+            )
+            .distinct()
+        )
+    ).scalars().all()
+
+    if cf_rows:
+        fv_rows = (
+            await db.execute(
+                select(EntityFieldValue.custom_field_id, EntityFieldValue.value).where(
+                    EntityFieldValue.entity_type == "Content",
+                    EntityFieldValue.entity_id == content_id,
+                    EntityFieldValue.is_deleted.is_(False),
+                )
+            )
+        ).all()
+        fv_map: dict[int, str | None] = {r[0]: r[1] for r in fv_rows}
+
+        multilang_fields = [cf for cf in cf_rows if cf.multi_language]
+        i18n_values: dict[str, list[str]] = {}
+        if multilang_fields:
+            i18n_rows = (
+                await db.execute(
+                    select(EntityI18n.field_name, EntityI18n.value).where(
+                        EntityI18n.entity_type == "Content",
+                        EntityI18n.entity_id == content_id,
+                        EntityI18n.is_deleted.is_(False),
+                        EntityI18n.field_name.in_([cf.field_code for cf in multilang_fields]),
+                    )
+                )
+            ).all()
+            for fname, fvalue in i18n_rows:
+                if fvalue is not None and str(fvalue).strip():
+                    i18n_values.setdefault(fname, []).append(str(fvalue))
+
+        for cf in cf_rows:
+            if cf.multi_language:
+                # 多语言字段：任一语言有值即视为已填（与弹窗保存口径对齐）
+                if not i18n_values.get(cf.field_code):
+                    missing.append(cf.field_name)
+            else:
+                v = fv_map.get(cf.id)
+                if v is None or not str(v).strip():
+                    missing.append(cf.field_name)
+
+    return (len(missing) == 0, missing)
+
 
 async def validate_metadata(
     db: AsyncSession,
@@ -82,7 +262,7 @@ async def validate_metadata(
         existing_metadata = None
         if entity_type == 'PROGRAM':
             existing_metadata = await get_content_metadata_by_content_id(db, content_id)
-        elif entity_type == 'SERIES':
+        elif entity_type in ('SERIES', 'SEASON_SERIES'):
             existing_metadata = await get_series_metadata_by_content_id(db, content_id)
         elif entity_type == 'CHANNEL':
             existing_metadata = await get_channel_metadata_by_content_id(db, content_id)
@@ -100,12 +280,18 @@ async def validate_metadata(
             logger.debug(f"编辑模式：合并现有元数据用于校验 (entity_type={entity_type}, content_id={content_id})")
         
         # 特殊处理：对于 PROGRAM/SERIES/CHANNEL/SCHEDULE，
-        # genre_id 存储在 content 主表中，需要从 content 获取
-        content = await get_content_by_id(db, content_id)
-        if content and hasattr(content, 'genre_id') and content.genre_id is not None:
-            # 将 genre_id 加入到 data_dict 中用于校验（用户提交的优先）
-            data_dict['genre_id'] = data_dict.get('genre_id') or content.genre_id
-            logger.debug(f"从 content 主表获取 genre_id={content.genre_id} 用于校验")
+        # genre_ids 存储在 content_genre 中间表中，需要从中间表获取
+        genre_stmt = select(ContentGenre.genre_id).where(
+            ContentGenre.content_id == content_id,
+            ContentGenre.is_deleted.is_(False),
+        )
+        genre_rows = (await db.execute(genre_stmt)).all()
+        genre_ids = [r[0] for r in genre_rows]
+        if genre_ids:
+            # 将 genre_ids 加入到 data_dict 中用于校验（用户提交的优先）
+            if not data_dict.get('genre_ids'):
+                data_dict['genre_ids'] = genre_ids
+                logger.debug(f"从 content_genre 中间表获取 genre_ids={genre_ids} 用于校验")
     
     # 收集所有校验错误
     errors = []
@@ -170,6 +356,12 @@ def _get_field_value(data_dict: dict, field_name: str) -> Any:
     for key, value in data_dict.items():
         if key.lower() == field_name_lower:
             return value
+    
+    # 3. 特殊字段映射：genre_id 映射到 genre_ids（从中间表获取的列表）
+    if field_name_lower == 'genre_id':
+        genre_ids = _get_field_value(data_dict, 'genre_ids')
+        if genre_ids and len(genre_ids) > 0:
+            return genre_ids[0]  # 返回第一个 genre_id
     
     return None
 
@@ -356,10 +548,10 @@ def _validate_length(
     violations = []
     
     if rule.min_length is not None and length < rule.min_length:
-        violations.append(f"最小长度{rule.min_length}")
+        violations.append(get_msg("VALIDATION_MIN_LENGTH", min=rule.min_length))
     
     if rule.max_length is not None and length > rule.max_length:
-        violations.append(f"最大长度{rule.max_length}")
+        violations.append(get_msg("VALIDATION_MAX_LENGTH", max=rule.max_length))
     
     if violations:
         field_label = rule.description or rule.field_name
@@ -395,7 +587,7 @@ def _validate_regex(
     try:
         if not re.match(rule.regex_pattern, field_value):
             field_label = rule.description or rule.field_name
-            return f"{field_label}: 格式不符合要求"
+            return get_msg("VALIDATION_FORMAT_INVALID", field=field_label)
     except re.error as e:
         logger.error(f"正则表达式错误: rule_id={rule.id}, pattern={rule.regex_pattern}, error={e}")
         return None
@@ -440,11 +632,11 @@ def _validate_enum(
         for val in field_value:
             if str(val) not in [str(a) for a in allowed]:
                 field_label = rule.description or rule.field_name
-                return f"{field_label}: 值 '{val}' 不在允许范围内"
+                return get_msg("VALIDATION_VALUE_NOT_ALLOWED", field=field_label, value=str(val))
     else:
         # 单值类型
         if str(field_value) not in [str(a) for a in allowed]:
             field_label = rule.description or rule.field_name
-            return f"{field_label}: 值 '{field_value}' 不在允许范围内"
+            return get_msg("VALIDATION_VALUE_NOT_ALLOWED", field=field_label, value=str(field_value))
     
     return None

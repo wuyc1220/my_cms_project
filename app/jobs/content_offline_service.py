@@ -9,7 +9,9 @@ ContentOffline 业务逻辑：扫描过期许可证并将关联内容状态切�
 2. 判定为过期的条件（在已 Published 的内容上再筛）：
    - 内容关联的未软删除许可证中，**至少存在一条** `end_date < today`（已过期）；且
    - 内容关联的未软删除许可证中，**不存在任何** `end_date IS NULL OR end_date >= today`（即没有任何有效许可证）。
-3. 过期后将该内容的 ingest 状态 `content.status` 更新为 `NoActiveLicense`。
+3. 过期后将该内容的 ingest 状态 `content.status` 更新为 `NoActiveLicense`，
+   并写入一条状态变更日志（content_status_log，处理人 system），
+   供详情页 Status Logs 展示。
 4. 已软删除（is_deleted=True）或已删除许可证（is_deleted=True）均不参与判定。
 
 容错策略（关键）：
@@ -33,6 +35,7 @@ from sqlalchemy import or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.internal.cms_biz_package.models.package import Content
+from app.internal.cms_biz_orchestration.services.workflow_service import record_status_change
 from app.internal.cms_biz_scp.models.trade import License, LicenseContent
 
 
@@ -118,6 +121,14 @@ async def scan_and_offline_expired_contents(db: AsyncSession) -> str:
                 update(Content)
                 .where(Content.id == content_id)
                 .values(status="NoActiveLicense", previous_status=None)
+            )
+            # 补写状态变更日志（与状态更新同一事务，处理人记为 system）
+            await record_status_change(
+                db,
+                content_id=content_id,
+                before_status=_SCAN_STATUS,
+                after_status="NoActiveLicense",
+                processed_by="system",
             )
             await db.commit()
             success_items.append((content_id, title))

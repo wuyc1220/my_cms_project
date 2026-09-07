@@ -2,7 +2,7 @@
 from contextvars import ContextVar
 from typing import Any
 
-from sqlalchemy import event
+from sqlalchemy import MetaData, event
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 from sqlalchemy.orm import DeclarativeBase
 from app.config import settings
@@ -34,6 +34,7 @@ engine = create_async_engine(
     connect_args={
         "timeout": 10,
         "command_timeout": 30,
+        "server_settings": {"search_path": f"{settings.db_schema},public"},
     },
 )
 
@@ -45,7 +46,7 @@ AsyncSessionLocal = async_sessionmaker(
 
 class Base(DeclarativeBase):
     """所有 SQLAlchemy 模型的基类"""
-    pass
+    metadata = MetaData(schema=settings.db_schema)
 
 
 # 自动填充 created_by 和 updated_by 的事件监听

@@ -5,10 +5,13 @@ from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import StreamingResponse
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.common.dependencies import _get_ip, get_current_user, get_db
+from app.common.dependencies import _get_ip, get_current_user, get_db, require_permission
 from app.common.schemas import BatchDeleteRequest, PaginatedResponse
+from app.common.utils.log_enricher import orm_to_dict, prepare_log_values
+from app.internal.cms_biz_system.models.metadata_quality import MetadataQualityCheck
 from app.internal.cms_biz_system.models.user import User
 from app.internal.cms_biz_system.schemas.metadata_quality import (
     DeleteMetadataChecksResponse,
@@ -74,6 +77,7 @@ async def api_trigger_check(
     request: Request,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
+    _: User = Depends(require_permission("menu.ops.monitor.operate")),
 ):
     new_id = await trigger_metadata_quality_check(db, operator=current_user.username)
     await write_log(
@@ -81,8 +85,8 @@ async def api_trigger_check(
         user_id=current_user.id,
         user_name=current_user.username,
         operation_type=OperationType.METADATA_QUALITY_TRIGGER,
-        operation_object=f"质量检查 ID={new_id}",
-        operation_content=f"Manually triggered metadata quality check: ID={new_id}",
+        operation_object_code="OBJ_QUALITY_CHECK", operation_object_params={"name": new_id},
+        operation_content_code="LOG_METADATA_QUALITY_TRIGGER", operation_content_params={"id": new_id},
         ip_address=_get_ip(request),
         result="success",
         entity_type="metadata_quality_check",
@@ -98,18 +102,27 @@ async def api_batch_delete_checks(
     request: Request,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
+    _: User = Depends(require_permission("menu.ops.monitor.operate")),
 ):
+    checks = (await db.execute(select(MetadataQualityCheck).where(MetadataQualityCheck.id.in_(body.ids), MetadataQualityCheck.is_deleted.is_(False)))).scalars().all()
+    check_ids = ", ".join([str(c.id) for c in checks]) if checks else str(body.ids)
+    prev_data = [orm_to_dict(c) for c in checks]
+    prev_val, _, raw_val = await prepare_log_values(db, "metadata_quality_check", prev_data, None)
     deleted = await delete_metadata_quality_checks(db, body.ids)
     await write_log(
         db,
         user_id=current_user.id,
         user_name=current_user.username,
         operation_type=OperationType.METADATA_QUALITY_BATCH_DELETE,
-        operation_object=f"质量检查 {body.ids}",
-        operation_content=f"批量删除质量检查: {body.ids}",
+        operation_object_code="OBJ_QUALITY_CHECK", operation_object_params={"name": check_ids},
+        operation_content_code="LOG_METADATA_QUALITY_BATCH_DELETE", operation_content_params={"names": check_ids},
         ip_address=_get_ip(request),
         result="success",
         entity_type="metadata_quality_check",
+        entity_id=body.ids[0] if body.ids else None,
+        previous_value=prev_val,
+        updated_value=None,
+        updated_value_json=raw_val,
     )
     await db.commit()
     return DeleteMetadataChecksResponse(deleted=deleted)
@@ -128,8 +141,8 @@ async def api_download_report(
         user_id=current_user.id,
         user_name=current_user.username,
         operation_type=OperationType.METADATA_QUALITY_EXPORT,
-        operation_object=f"质量检查 ID={check_id}",
-        operation_content=f"Downloaded metadata quality report: ID={check_id}",
+        operation_object_code="OBJ_QUALITY_CHECK", operation_object_params={"name": check_id},
+        operation_content_code="LOG_METADATA_QUALITY_EXPORT", operation_content_params={"id": check_id},
         ip_address=_get_ip(request),
         result="success",
         entity_type="metadata_quality_check",

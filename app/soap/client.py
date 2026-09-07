@@ -1,37 +1,85 @@
-"""SOAP 客户端实现"""
+"""SOAP 客户端实现 - 直接发送原始 XML"""
 import uuid
+import xml.etree.ElementTree as ET
 from typing import Dict, Any, Optional
 from loguru import logger
-
-try:
-    from zeep import Client
-    from zeep.transports import Transport
-    import requests
-    ZEEP_AVAILABLE = True
-except ImportError:
-    ZEEP_AVAILABLE = False
-    logger.warning("zeep 库未安装，SOAP 功能不可用。请运行: pip install zeep")
+import requests
 
 from .config import soap_settings
+from app.common.core.i18n import get_msg
+
+
+# SOAP 请求 XML 模板（参照 LSP 提供的示例格式）
+EXEC_CMD_TEMPLATE = """<?xml version="1.0" encoding="UTF-8"?>
+<SOAP-ENV:Envelope xmlns:SOAP-ENV="http://schemas.xmlsoap.org/soap/envelope/"
+    xmlns:SOAP-ENC="http://schemas.xmlsoap.org/soap/encoding/"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    xmlns:xsd="http://www.w3.org/2001/XMLSchema"
+    xmlns:m0="http://schemas.xmlsoap.org/soap/encoding/">
+<SOAP-ENV:Body>
+<m:ExecCmd xmlns:m="iptv" SOAP-ENV:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
+    <CSPID xsi:type="m0:string">{csp_id}</CSPID>
+    <LSPID xsi:type="m0:string">{lsp_id}</LSPID>
+    <CorrelateID xsi:type="m0:string">{correlate_id}</CorrelateID>
+    <CmdFileURL xsi:type="m0:string">{cmd_file_url}</CmdFileURL>
+</m:ExecCmd>
+</SOAP-ENV:Body>
+</SOAP-ENV:Envelope>"""
 
 
 class SOAPClient:
-    """SOAP 内容分发客户端"""
+    """SOAP 内容分发客户端（原始 XML 模式）"""
     
     def __init__(self):
         """初始化 SOAP 客户端"""
-        if not ZEEP_AVAILABLE:
-            raise ImportError("zeep 库未安装，请运行: pip install zeep")
-        
-        self.client = None
+        self.session = requests.Session()
+        self.session.headers.update({
+            "Content-Type": "text/xml; charset=utf-8",
+            "SOAPAction": ""
+        })
         if soap_settings.enabled:
-            try:
-                transport = Transport(timeout=soap_settings.timeout)
-                self.client = Client(soap_settings.lsp_soap_url, transport=transport)
-                logger.info(f"SOAP 客户端初始化成功，LSP 地址: {soap_settings.lsp_soap_url}")
-            except Exception as e:
-                logger.error(f"SOAP 客户端初始化失败: {e}")
-                raise
+            logger.info(f"SOAP 客户端初始化成功，LSP 地址: {soap_settings.lsp_soap_url}")
+    
+    def _parse_response(self, response_text: str) -> Dict[str, Any]:
+        """
+        解析 SOAP 响应 XML，提取 Result 和 ErrorDescription
+        
+        响应格式示例:
+        <ExecCmdReturn>
+            <Result>0</Result>
+            <ErrorDescription></ErrorDescription>
+        </ExecCmdReturn>
+        """
+        try:
+            # 去除命名空间前缀以简化解析
+            root = ET.fromstring(response_text)
+            
+            # 递归查找 Result 和 ErrorDescription 节点
+            result_val = None
+            error_desc = ""
+            
+            for elem in root.iter():
+                tag = elem.tag.split("}")[-1] if "}" in elem.tag else elem.tag
+                if tag == "Result":
+                    result_val = elem.text
+                elif tag == "ErrorDescription":
+                    error_desc = elem.text or ""
+            
+            if result_val is not None:
+                return {
+                    "Result": int(result_val),
+                    "ErrorDescription": error_desc
+                }
+            else:
+                return {
+                    "Result": -1,
+                    "ErrorDescription": f"无法从响应中解析 Result: {response_text[:500]}"
+                }
+        except Exception as e:
+            return {
+                "Result": -1,
+                "ErrorDescription": f"响应解析失败: {e}, 原始响应: {response_text[:500]}"
+            }
     
     def send_exec_cmd_req(
         self,
@@ -39,99 +87,76 @@ class SOAPClient:
         correlate_id: Optional[str] = None
     ) -> Dict[str, Any]:
         """
-        发送执行指令请求 (ExecCmdReq)
+        发送执行指令请求 (ExecCmd)
         
         Args:
             cmd_file_url: XML 指令文件 URL
             correlate_id: 关联 ID（可选，不传则自动生成）
             
         Returns:
-            响应结果 {"Result": 0, "ErrorDescription": ""}
+            响应结果 {"success": bool, "correlate_id": str, "result": int, "error_description": str}
         """
-        if not self.client:
-            raise RuntimeError("SOAP 客户端未初始化，请检查 SOAP_ENABLED 配置")
+        if not soap_settings.enabled:
+            raise RuntimeError(get_msg("SOAP_CLIENT_NOT_ENABLED"))
         
         if not correlate_id:
-            correlate_id = str(uuid.uuid4())
+            correlate_id = uuid.uuid4().hex  # 32位无横线 UUID
+        
+        # 构造 SOAP XML 请求体
+        soap_body = EXEC_CMD_TEMPLATE.format(
+            csp_id=soap_settings.csp_id,
+            lsp_id=soap_settings.lsp_id,
+            correlate_id=correlate_id,
+            cmd_file_url=cmd_file_url
+        )
         
         try:
             logger.info(
-                f"发送 ExecCmdReq - CorrelateID: {correlate_id}, "
-                f"CmdFileURL: {cmd_file_url}"
+                f"发送 ExecCmd - CorrelateID: {correlate_id}, "
+                f"CmdFileURL: {cmd_file_url}, "
+                f"目标地址: {soap_settings.lsp_soap_url}"
+            )
+            logger.info(f"========== SOAP 请求 XML ==========\n{soap_body}\n====================================")
+            
+            # 发送 HTTP POST 请求
+            response = self.session.post(
+                soap_settings.lsp_soap_url,
+                data=soap_body.encode("utf-8"),
+                timeout=soap_settings.timeout
             )
             
-            # 调用 LSP 的 ExecCmdReq 接口
-            result = self.client.service.ExecCmdReq(
-                CSPID=soap_settings.csp_id,
-                LSPID=soap_settings.lsp_id,
-                CorrelateID=correlate_id,
-                CmdFileURL=cmd_file_url
-            )
+            logger.info(f"SOAP 响应状态码: {response.status_code}")
+            logger.info(f"========== SOAP 响应 XML ==========\n{response.text}\n====================================")
+            
+            # 解析响应
+            result = self._parse_response(response.text)
             
             logger.info(
-                f"ExecCmdReq 响应 - CorrelateID: {correlate_id}, "
-                f"Result: {result.get('Result')}"
+                f"ExecCmd 响应 - CorrelateID: {correlate_id}, "
+                f"Result: {result['Result']}, "
+                f"ErrorDescription: {result['ErrorDescription']}"
             )
             
             return {
-                "success": result.get("Result") == 0,
+                "success": result["Result"] == 0,
                 "correlate_id": correlate_id,
-                "result": result.get("Result"),
-                "error_description": result.get("ErrorDescription", "")
+                "result": result["Result"],
+                "error_description": result["ErrorDescription"]
             }
             
-        except Exception as e:
-            logger.error(f"ExecCmdReq 调用失败 - CorrelateID: {correlate_id}, 错误: {e}")
+        except requests.exceptions.Timeout:
+            logger.error(f"ExecCmd 请求超时 - CorrelateID: {correlate_id}")
             return {
                 "success": False,
                 "correlate_id": correlate_id,
                 "result": -1,
-                "error_description": str(e)
+                "error_description": f"请求超时（{soap_settings.timeout}秒）"
             }
-    
-    def send_result_notify_res(
-        self,
-        correlate_id: str,
-        result: int = 0,
-        error_description: Optional[str] = None
-    ) -> Dict[str, Any]:
-        """
-        发送结果通知响应 (ResultNotifyRes)
-        
-        Args:
-            correlate_id: 关联 ID
-            result: 接收结果 (0=成功, -1=失败)
-            error_description: 错误描述
-            
-        Returns:
-            响应结果
-        """
-        if not self.client:
-            raise RuntimeError("SOAP 客户端未初始化")
-        
-        try:
-            logger.info(
-                f"发送 ResultNotifyRes - CorrelateID: {correlate_id}, "
-                f"Result: {result}"
-            )
-            
-            response = self.client.service.ResultNotifyRes(
-                Result=result,
-                ErrorDescription=error_description or ""
-            )
-            
-            logger.info(f"ResultNotifyRes 响应 - CorrelateID: {correlate_id}")
-            
-            return {
-                "success": response.get("Result") == 0,
-                "result": response.get("Result"),
-                "error_description": response.get("ErrorDescription", "")
-            }
-            
         except Exception as e:
-            logger.error(f"ResultNotifyRes 调用失败 - CorrelateID: {correlate_id}, 错误: {e}")
+            logger.error(f"ExecCmd 调用失败 - CorrelateID: {correlate_id}, 错误: {e}")
             return {
                 "success": False,
+                "correlate_id": correlate_id,
                 "result": -1,
                 "error_description": str(e)
             }
@@ -184,7 +209,7 @@ class SOAPCommandService:
             xml_url = self.xml_generator.get_xml_url(xml_filepath)
             
             # 3. 生成关联 ID
-            correlate_id = str(uuid.uuid4())
+            correlate_id = uuid.uuid4().hex
             
             # 4. 发送 SOAP 请求
             result = self.soap_client.send_exec_cmd_req(
@@ -246,7 +271,7 @@ class SOAPCommandService:
             xml_url = self.xml_generator.get_xml_url(xml_filepath)
             
             # 3. 生成关联 ID
-            correlate_id = str(uuid.uuid4())
+            correlate_id = uuid.uuid4().hex
             
             # 4. 发送 SOAP 请求
             result = self.soap_client.send_exec_cmd_req(

@@ -12,19 +12,19 @@ from pydantic import BaseModel, ConfigDict, Field
 # ═════════════════════════════════════════════════════════════
 
 class MetadataSourceCreate(BaseModel):
-    """新增数据源"""
+    """Create metadata source"""
     name: str = Field(..., max_length=200)
     content_type: str = Field(..., max_length=50, description="Movie/Series/Cast")
-    collect_type: str = Field(default="API", max_length=50, description="采集方式：API/网页爬取")
+    collect_type: str = Field(default="API", max_length=50, description="Collection method: API/Web Crawl")
     url: str = Field(..., max_length=500)
     api_endpoint: str | None = Field(None, max_length=500)
     auth_type: str | None = Field(None, max_length=50, description="API_Key/OAuth2.0/None")
-    api_key: str | None = Field(None, max_length=500, description="认证方式为API_Key时必填")
-    rate_limit: int = Field(default=1000, ge=1, description="请求频率限制（次/小时）")
+    api_key: str | None = Field(None, max_length=500, description="Required when auth type is API_Key")
+    rate_limit: int = Field(default=1000, ge=1, description="Rate limit (requests/hour)")
     status: str = Field(default="YES", max_length=10, description="YES/NO")
-    page_url_template: str | None = Field(None, max_length=500, description="爬取目标页面URL模板")
+    page_url_template: str | None = Field(None, max_length=500, description="Crawl target page URL template")
     render_type: str | None = Field(None, max_length=50, description="StaticHTML/HeadlessBrowser")
-    field_extract_rules: str | None = Field(None, description="字段提取规则配置（JSON格式）")
+    field_extract_rules: str | None = Field(None, description="Field extraction rules config (JSON)")
 
 
 class MetadataSourceUpdate(BaseModel):
@@ -44,7 +44,7 @@ class MetadataSourceUpdate(BaseModel):
 
 
 class MetadataSourceListItem(BaseModel):
-    """数据源列表项"""
+    """Metadata source list item"""
     id: int
     name: str
     content_type: str
@@ -52,7 +52,7 @@ class MetadataSourceListItem(BaseModel):
     url: str
     api_endpoint: str | None = None
     auth_type: str | None = None
-    api_key: str | None = Field(None, description="前端展示为掩码")
+    api_key: str | None = Field(None, description="Displayed as mask on frontend")
     rate_limit: int
     status: str
     page_url_template: str | None = None
@@ -64,12 +64,12 @@ class MetadataSourceListItem(BaseModel):
 
 
 class MetadataSourceStatusToggle(BaseModel):
-    """切换数据源状态"""
+    """Toggle metadata source status"""
     status: str = Field(..., max_length=10, description="YES/NO")
 
 
 class BatchStatusRequest(BaseModel):
-    """批量启用/禁用请求"""
+    """Batch enable/disable request"""
     ids: list[int]
     status: str = Field(..., max_length=10, description="YES/NO")
 
@@ -146,16 +146,16 @@ class CrawlTaskQueryParams(BaseModel):
 # ═════════════════════════════════════════════════════════════
 
 class CrawlRequest(BaseModel):
-    """触发爬取请求"""
-    object_name: str = Field(..., max_length=500, description="爬取对象名称")
-    object_type: str = Field(..., max_length=50, description="对象类型：Movie/Series/Cast")
+    """Trigger crawl request"""
+    object_name: str = Field(..., max_length=500, description="Crawl object name")
+    object_type: str = Field(..., max_length=50, description="Object type: Movie/Series/Cast")
     field_codes: list[dict[str, str]] = Field(
-        ..., description="字段列表：[{code, name}]，code为字段编码，name为字段显示名"
+        ..., description="Field list: [{code, name}], code=field code, name=display name"
     )
 
 
 class CrawlFieldCandidate(BaseModel):
-    """单个字段的候选值"""
+    """Single field candidate value"""
     detail_id: int
     field_code: str
     field_name: str
@@ -164,15 +164,15 @@ class CrawlFieldCandidate(BaseModel):
 
 
 class CrawlProgressItem(BaseModel):
-    """爬取进度项"""
+    """Crawl progress item"""
     task_id: int
     source_name: str
     crawl_status: str
-    progress: int = Field(default=0, ge=0, le=100, description="进度百分比")
+    progress: int = Field(default=0, ge=0, le=100, description="Progress percentage")
 
 
 class CrawlResponse(BaseModel):
-    """爬取响应（进度+候选值）"""
+    """Crawl response (progress + candidates)"""
     object_name: str
     object_type: str
     progress_items: list[CrawlProgressItem] = []
@@ -180,18 +180,18 @@ class CrawlResponse(BaseModel):
 
 
 class CrawlConfirmSelection(BaseModel):
-    """单个字段的选择"""
+    """Single field selection"""
     detail_id: int
     is_used: str = Field(default="YES", max_length=10, description="YES/NO")
 
 
 class CrawlConfirmRequest(BaseModel):
-    """确认选择请求"""
+    """Confirm selection request"""
     selections: list[CrawlConfirmSelection]
 
 
 class CrawlConfirmResult(BaseModel):
-    """确认选择结果"""
+    """Confirm selection result"""
     field_code: str
     field_name: str
     crawl_data: str | None = None

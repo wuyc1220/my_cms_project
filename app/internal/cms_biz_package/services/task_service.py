@@ -11,7 +11,7 @@
 from datetime import datetime
 
 from loguru import logger
-from sqlalchemy import select
+from sqlalchemy import select, delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.internal.cms_biz_package.models.task import Task, TaskHistory
@@ -80,6 +80,24 @@ async def _ensure_content_auth(db: AsyncSession, content_id: int, user_id: int) 
         logger.info(
             "自动添加数据权限 | content_id={} user_id={}", content_id, user_id
         )
+
+
+async def _revoke_content_auth_for_user(
+    db: AsyncSession, content_id: int, user_id: int
+) -> None:
+    """删除指定内容对指定用户的授权记录（仅删除任务指派自动添加的用户授权，不影响角色授权）。"""
+    await db.execute(
+        delete(ContentAuth).where(
+            ContentAuth.content_id == content_id,
+            ContentAuth.user_id == user_id,
+            ContentAuth.role_id.is_(None),
+            ContentAuth.is_deleted.is_(False),
+        )
+    )
+    await db.flush()
+    logger.info(
+        "删除任务指派产生的数据权限 | content_id={} user_id={}", content_id, user_id
+    )
 
 
 async def _update_content_process_assigned(
@@ -283,6 +301,7 @@ async def assign_task(
         raise BusinessException(ErrorCode.TASK_COMPLETED_CANNOT_MODIFY, get_msg("TASK_COMPLETED_CANNOT_MODIFY"))
 
     # 记录旧值
+    old_assignee_id = task.assignee_id
     old_assignee_name = await _get_user_name(db, task.assignee_id)
     new_assignee_name = await _get_user_name(db, data.assignee_id)
 
@@ -304,6 +323,9 @@ async def assign_task(
 
     # 自动添加数据权限
     await _ensure_content_auth(db, task.content_id, data.assignee_id)
+    # 移除旧负责人的任务指派授权（仅限 role_id 为空的用户授权，不影响角色授权）
+    if old_assignee_id is not None and old_assignee_id != data.assignee_id:
+        await _revoke_content_auth_for_user(db, task.content_id, old_assignee_id)
 
     # 同步更新 content_process 表的 assigned 字段（审批任务）
     if task.task_type in ["review L1", "review L2", "review L3"]:
@@ -320,6 +342,7 @@ async def assign_task(
             )
             for child_task in child_tasks:
                 if child_task.task_status != "Completed":
+                    child_old_assignee_id = child_task.assignee_id
                     child_old = await _get_user_name(db, child_task.assignee_id)
                     child_task.assignee_id = data.assignee_id
                     if child_task.task_status == "Not Assigned":
@@ -336,6 +359,8 @@ async def assign_task(
                         ),
                     )
                     await _ensure_content_auth(db, child_task.content_id, data.assignee_id)
+                    if child_old_assignee_id is not None and child_old_assignee_id != data.assignee_id:
+                        await _revoke_content_auth_for_user(db, child_task.content_id, child_old_assignee_id)
             logger.info(
                 "同步更新子内容任务 | parent_task={} child_count={}",
                 task_id, len(child_tasks),
@@ -364,6 +389,7 @@ async def batch_assign_tasks(
         if task.task_status == "Completed":
             continue
 
+        old_assignee_id = task.assignee_id
         old_assignee_name = await _get_user_name(db, task.assignee_id)
         new_assignee_name = await _get_user_name(db, assignee_id)
 
@@ -383,6 +409,9 @@ async def batch_assign_tasks(
             ),
         )
         await _ensure_content_auth(db, task.content_id, assignee_id)
+        # 移除旧负责人的任务指派授权（仅限 role_id 为空的用户授权，不影响角色授权）
+        if old_assignee_id is not None and old_assignee_id != assignee_id:
+            await _revoke_content_auth_for_user(db, task.content_id, old_assignee_id)
 
         # 同步更新 content_process 表的 assigned 字段（审批任务）
         if task.task_type in ["review L1", "review L2", "review L3"]:
@@ -398,6 +427,7 @@ async def batch_assign_tasks(
                 )
                 for child_task in child_tasks:
                     if child_task.task_status != "Completed":
+                        child_old_assignee_id = child_task.assignee_id
                         child_old = await _get_user_name(db, child_task.assignee_id)
                         child_task.assignee_id = assignee_id
                         if child_task.task_status == "Not Assigned":
@@ -414,6 +444,8 @@ async def batch_assign_tasks(
                             ),
                         )
                         await _ensure_content_auth(db, child_task.content_id, assignee_id)
+                        if child_old_assignee_id is not None and child_old_assignee_id != assignee_id:
+                            await _revoke_content_auth_for_user(db, child_task.content_id, child_old_assignee_id)
 
         assigned_count += 1
 
@@ -497,3 +529,65 @@ async def create_review_task(
         content_id, review_level, task.id,
     )
     return task
+
+
+# ─── 任务状态恢复 ─────────────────────────────────────────────────────
+
+async def reopen_arrangement_task(
+    db: AsyncSession,
+    content_id: int,
+    processed_by: str | None = None,
+    reason: str = "",
+) -> None:
+    """内容下架成功后，将 arrangement 任务由 Completed 恢复为待处理。
+
+    PRD 3.7.2.4：内容下架成功，则对应的内容编排任务状态，会自动恢复成待处理。
+    发布/下架两条执行路径（模拟模式与 LSP 回调）统一调用本函数。
+
+    处理要素：
+        1. 仅当任务当前为 Completed 时恢复（Not Assigned / Pending 保持不变）
+        2. 清空 end_time
+        3. start_time 重置为当前时间（对齐首页看板 Start Time 本轮处理周期语义）
+        4. 写入 TaskHistory "Reopen" 记录
+    """
+    arrangement_task = (
+        await db.execute(
+            select(Task).where(
+                Task.content_id == content_id,
+                Task.task_type == "arrangement",
+                Task.is_deleted.is_(False),
+            )
+        )
+    ).scalar_one_or_none()
+
+    if arrangement_task is None:
+        logger.info("下架恢复：无存活的 arrangement 任务，跳过 | content_id={}", content_id)
+        return
+
+    if arrangement_task.task_status != "Completed":
+        logger.info(
+            "下架恢复：arrangement 任务非 Completed（当前 {}），跳过 | content_id={} task_id={}",
+            arrangement_task.task_status, content_id, arrangement_task.id,
+        )
+        return
+
+    now = datetime.now()
+    old_status = arrangement_task.task_status
+    arrangement_task.task_status = "Pending"
+    arrangement_task.end_time = None
+    arrangement_task.start_time = now
+    await task_repo.add_task_history(
+        db,
+        TaskHistory(
+            task_id=arrangement_task.id,
+            processed_type="Reopen",
+            processed_by=processed_by or "system",
+            previous_value=old_status,
+            updated_value=f"任务恢复待处理: {reason}" if reason else "任务恢复待处理",
+        ),
+    )
+
+    logger.info(
+        "下架成功，arrangement 任务恢复为待处理 | content_id={} task_id={}",
+        content_id, arrangement_task.id,
+    )

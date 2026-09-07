@@ -62,8 +62,8 @@ async def create_custom_field_api(
         user_id=current_user.id,
         user_name=current_user.username,
         operation_type=OperationType.CUSTOM_FIELD_CREATE,
-        operation_object=f"自定义字段 {body.field_name}",
-        operation_content=f"Created custom field: name={body.field_name}, type={body.field_type}",
+        operation_object_code="OBJ_CUSTOM_FIELD", operation_object_params={"name": body.field_name},
+        operation_content_code="LOG_CUSTOM_FIELD_CREATE", operation_content_params={"name": body.field_name},
         ip_address=_get_ip(request),
         result="success",
         previous_value=prev_val,
@@ -95,8 +95,8 @@ async def update_custom_field_api(
         user_id=current_user.id,
         user_name=current_user.username,
         operation_type=OperationType.CUSTOM_FIELD_EDIT,
-        operation_object=f"自定义字段 {old_name}",
-        operation_content=f"Updated custom field: ID={field_id}, name={cf.field_name}",
+        operation_object_code="OBJ_CUSTOM_FIELD", operation_object_params={"name": old_name},
+        operation_content_code="LOG_CUSTOM_FIELD_EDIT", operation_content_params={"name": cf.field_name},
         ip_address=_get_ip(request),
         result="success",
         previous_value=prev_val,
@@ -116,20 +116,25 @@ async def batch_delete_custom_fields_api(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    rows = (await db.execute(select(CustomField.field_name).where(CustomField.id.in_(body.ids), CustomField.is_deleted.is_(False)))).scalars().all()
-    field_names = ", ".join(rows) if rows else str(body.ids)
+    fields = (await db.execute(select(CustomField).where(CustomField.id.in_(body.ids), CustomField.is_deleted.is_(False)))).scalars().all()
+    field_names = ", ".join([f.field_name for f in fields]) if fields else str(body.ids)
+    prev_data = [orm_to_dict(f) for f in fields]
+    prev_val, _, raw_val = await prepare_log_values(db, "custom_field", prev_data, None)
     deleted = await batch_delete_custom_fields(db, body)
     await write_log(
         db,
         user_id=current_user.id,
         user_name=current_user.username,
         operation_type=OperationType.CUSTOM_FIELD_BATCH_DELETE,
-        operation_object=f"custom_field:{field_names}",
-        operation_content=f"log.custom_field.batch_delete:{field_names}",
+        operation_object_code="OBJ_CUSTOM_FIELD", operation_object_params={"name": field_names},
+        operation_content_code="LOG_CUSTOM_FIELD_BATCH_DELETE", operation_content_params={"names": field_names},
         ip_address=_get_ip(request),
         result="success",
         entity_type="custom_field",
         entity_id=body.ids[0] if body.ids else None,
+        previous_value=prev_val,
+        updated_value=None,
+        updated_value_json=raw_val,
     )
     await db.commit()
     return {"success": True, "deleted": deleted}
@@ -152,8 +157,8 @@ async def delete_custom_field_api(
         user_id=current_user.id,
         user_name=current_user.username,
         operation_type=OperationType.CUSTOM_FIELD_DELETE,
-        operation_object=f"自定义字段 {cf_name}",
-        operation_content=f"Deleted custom field: ID={field_id}, name={cf_name}",
+        operation_object_code="OBJ_CUSTOM_FIELD", operation_object_params={"name": cf_name},
+        operation_content_code="LOG_CUSTOM_FIELD_DELETE", operation_content_params={"name": cf_name},
         ip_address=_get_ip(request),
         result="success",
         previous_value=prev_val,

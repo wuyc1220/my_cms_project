@@ -38,6 +38,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.common.dependencies import _get_ip, get_current_user, get_db
 from app.common.utils.log_enricher import orm_to_dict, prepare_log_values
+from app.internal.cms_biz_metada.models.basic import CustomTag
 from app.internal.cms_biz_system.models.user import User
 from app.internal.cms_biz_system.services.operation_log_service import (
     OperationType,
@@ -59,10 +60,24 @@ from app.internal.cms_biz_orchestration.schemas.content_metadata import (
     MetadataDetailItem,
 )
 from app.internal.cms_biz_orchestration.services import metadata_service
-from app.internal.cms_biz_package.models.package import Content
+from app.internal.cms_biz_package.models.package import Content, ContentCustomTag
 
 
 router = APIRouter(prefix="/metadata", tags=["元数据管理"])
+
+
+async def _load_custom_tag_names(db: AsyncSession, content_id: int) -> list[str]:
+    """查询内容关联的自定义标签名称列表。
+
+    Custom Tags 存于 content_custom_tag 中间表（元数据表无此列，弹窗保存时经
+    updateContent 单独提交），日志快照补记名称供 Activity Log 展示（bug 32430）。
+    """
+    rows = (await db.execute(
+        select(ContentCustomTag.custom_tag_id, CustomTag.name)
+        .join(CustomTag, ContentCustomTag.custom_tag_id == CustomTag.id)
+        .where(ContentCustomTag.content_id == content_id, CustomTag.is_deleted.is_(False))
+    )).all()
+    return [row.name for row in rows]
 
 
 # ═══════════════════════════════════════════════════════════
@@ -118,8 +133,8 @@ async def create_program_metadata(
         user_id=current_user.id,
         user_name=current_user.username,
         operation_type=OperationType.PROGRAM_METADATA_CREATE,
-        operation_object=f"Program元数据 {result.name}",
-        operation_content="log.metadata.create",
+        operation_object_code="OBJ_PROGRAM_METADATA", operation_object_params={"name": result.name},
+        operation_content_code="log.metadata.create",
         content_id=content_id,
         entity_type="program_metadata",
         entity_id=result.id,
@@ -154,8 +169,8 @@ async def update_program_metadata(
             user_id=current_user.id,
             user_name=current_user.username,
             operation_type=OperationType.PROGRAM_METADATA_UPDATE,
-            operation_object=f"Program元数据 {result.name}",
-            operation_content="log.metadata.edit",
+            operation_object_code="OBJ_PROGRAM_METADATA", operation_object_params={"name": result.name},
+            operation_content_code="log.metadata.edit",
             content_id=content_id,
             entity_type="program_metadata",
             entity_id=result.id,
@@ -187,8 +202,8 @@ async def delete_program_metadata(
         user_id=current_user.id,
         user_name=current_user.username,
         operation_type=OperationType.PROGRAM_METADATA_DELETE,
-        operation_object=f"Program元数据 {meta_name}",
-        operation_content="log.metadata.delete",
+        operation_object_code="OBJ_PROGRAM_METADATA", operation_object_params={"name": meta_name},
+        operation_content_code="log.metadata.delete",
         content_id=content_id,
         entity_type="program_metadata",
         entity_id=old.id if old else None,
@@ -237,8 +252,8 @@ async def create_series_metadata(
         user_id=current_user.id,
         user_name=current_user.username,
         operation_type=OperationType.SERIES_METADATA_CREATE,
-        operation_object=f"Series元数据 {result.name}",
-        operation_content="log.metadata.create",
+        operation_object_code="OBJ_SERIES_METADATA", operation_object_params={"name": result.name},
+        operation_content_code="log.metadata.create",
         content_id=content_id,
         entity_type="series_metadata",
         entity_id=result.id,
@@ -264,7 +279,10 @@ async def update_series_metadata(
     import copy
     old = await metadata_service.get_series_metadata(db, content_id)
     old_data = copy.deepcopy(orm_to_dict(old, "series_metadata")) if old else {}
-    result = await metadata_service.update_series_metadata(db, content_id, data, processed_by=current_user.username)
+    result = await metadata_service.update_series_metadata(
+        db, content_id, data, processed_by=current_user.username,
+        actor_id=current_user.id, ip_address=_get_ip(request),
+    )
     new_data = orm_to_dict(result, "series_metadata")
     prev_val, upd_val, raw_val = await prepare_log_values(db, "series_metadata", old_data, new_data)
     if prev_val is not None or upd_val is not None:
@@ -273,8 +291,8 @@ async def update_series_metadata(
             user_id=current_user.id,
             user_name=current_user.username,
             operation_type=OperationType.SERIES_METADATA_UPDATE,
-            operation_object=f"Series元数据 {result.name}",
-            operation_content="log.metadata.edit",
+            operation_object_code="OBJ_SERIES_METADATA", operation_object_params={"name": result.name},
+            operation_content_code="log.metadata.edit",
             content_id=content_id,
             entity_type="series_metadata",
             entity_id=result.id,
@@ -306,8 +324,8 @@ async def delete_series_metadata(
         user_id=current_user.id,
         user_name=current_user.username,
         operation_type=OperationType.SERIES_METADATA_DELETE,
-        operation_object=f"Series元数据 {meta_name}",
-        operation_content="log.metadata.delete",
+        operation_object_code="OBJ_SERIES_METADATA", operation_object_params={"name": meta_name},
+        operation_content_code="log.metadata.delete",
         content_id=content_id,
         entity_type="series_metadata",
         entity_id=old.id if old else None,
@@ -356,8 +374,8 @@ async def create_channel_metadata(
         user_id=current_user.id,
         user_name=current_user.username,
         operation_type=OperationType.CHANNEL_METADATA_CREATE,
-        operation_object=f"频道元数据 {result.name}",
-        operation_content="log.metadata.create",
+        operation_object_code="OBJ_CHANNEL", operation_object_params={"name": result.name},
+        operation_content_code="log.metadata.create",
         content_id=content_id,
         entity_type="channel_metadata",
         entity_id=result.id,
@@ -392,8 +410,8 @@ async def update_channel_metadata(
             user_id=current_user.id,
             user_name=current_user.username,
             operation_type=OperationType.CHANNEL_METADATA_UPDATE,
-            operation_object=f"频道元数据 {result.name}",
-            operation_content="log.metadata.edit",
+            operation_object_code="OBJ_CHANNEL", operation_object_params={"name": result.name},
+            operation_content_code="log.metadata.edit",
             content_id=content_id,
             entity_type="channel_metadata",
             entity_id=result.id,
@@ -425,8 +443,8 @@ async def delete_channel_metadata(
         user_id=current_user.id,
         user_name=current_user.username,
         operation_type=OperationType.CHANNEL_METADATA_DELETE,
-        operation_object=f"频道元数据 {meta_name}",
-        operation_content="log.metadata.delete",
+        operation_object_code="OBJ_CHANNEL", operation_object_params={"name": meta_name},
+        operation_content_code="log.metadata.delete",
         content_id=content_id,
         entity_type="channel_metadata",
         entity_id=old.id if old else None,
@@ -469,14 +487,17 @@ async def create_schedule_metadata(
         db, ScheduleMetadataCreate(**data_dict), processed_by=current_user.username
     )
     new_data = orm_to_dict(result, "schedule_metadata")
+    # Custom Tags 存于 content 主表关联（schedule_metadata 表无此列，弹窗保存时经 updateContent 单独提交），
+    # 日志快照补记名称列表，供 Activity Log 展示（bug 32430）
+    new_data["custom_tag_names"] = await _load_custom_tag_names(db, content_id)
     prev_val, upd_val, raw_val = await prepare_log_values(db, "schedule_metadata", None, new_data)
     await write_log(
         db,
         user_id=current_user.id,
         user_name=current_user.username,
         operation_type=OperationType.SCHEDULE_METADATA_CREATE,
-        operation_object=f"节目单元数据 {result.name}",
-        operation_content="log.metadata.create",
+        operation_object_code="OBJ_SCHEDULE", operation_object_params={"name": result.name},
+        operation_content_code="log.metadata.create",
         content_id=content_id,
         entity_type="schedule_metadata",
         entity_id=result.id,
@@ -504,6 +525,12 @@ async def update_schedule_metadata(
     old_data = copy.deepcopy(orm_to_dict(old, "schedule_metadata")) if old else {}
     result = await metadata_service.update_schedule_metadata(db, content_id, data, processed_by=current_user.username)
     new_data = orm_to_dict(result, "schedule_metadata")
+    # Custom Tags 存于 content 主表关联，prev/new 快照补记同一名称列表：
+    # 本接口不产生 tags 变更（由 updateContent 单独提交），补齐后 diff 不产生误报（bug 32430）
+    tag_names = await _load_custom_tag_names(db, content_id)
+    if old_data:
+        old_data["custom_tag_names"] = tag_names
+    new_data["custom_tag_names"] = tag_names
     prev_val, upd_val, raw_val = await prepare_log_values(db, "schedule_metadata", old_data, new_data)
     if prev_val is not None or upd_val is not None:
         await write_log(
@@ -511,8 +538,8 @@ async def update_schedule_metadata(
             user_id=current_user.id,
             user_name=current_user.username,
             operation_type=OperationType.SCHEDULE_METADATA_UPDATE,
-            operation_object=f"节目单元数据 {result.name}",
-            operation_content="log.metadata.edit",
+            operation_object_code="OBJ_SCHEDULE", operation_object_params={"name": result.name},
+            operation_content_code="log.metadata.edit",
             content_id=content_id,
             entity_type="schedule_metadata",
             entity_id=result.id,
@@ -544,8 +571,8 @@ async def delete_schedule_metadata(
         user_id=current_user.id,
         user_name=current_user.username,
         operation_type=OperationType.SCHEDULE_METADATA_DELETE,
-        operation_object=f"节目单元数据 {meta_name}",
-        operation_content="log.metadata.delete",
+        operation_object_code="OBJ_SCHEDULE", operation_object_params={"name": meta_name},
+        operation_content_code="log.metadata.delete",
         content_id=content_id,
         entity_type="schedule_metadata",
         entity_id=old.id if old else None,

@@ -4,8 +4,6 @@
 路由前缀：/ingest-histories
 """
 
-from urllib.parse import quote
-
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -15,6 +13,7 @@ from app.common.schemas import PaginatedResponse
 from app.internal.cms_biz_orchestration.models.ingest_history import IngestHistory
 from app.internal.cms_biz_orchestration.models.ingest_history_detail import IngestHistoryDetail
 from app.internal.cms_biz_orchestration.schemas.ingest_history import IngestHistoryItem, IngestHistoryDetailItem
+from app.internal.cms_biz_orchestration.services.storage import storage_service
 from app.internal.cms_biz_system.models.user import User
 
 router = APIRouter(prefix="/ingest-histories")
@@ -36,11 +35,11 @@ def _build_ingest_history_item(history: IngestHistory) -> IngestHistoryItem:
         "ingest_xml_path": history.ingest_xml_path,
         "result_xml_path": history.result_xml_path,
     }
-    # 添加下载 URL（不含 /api/v1 前缀，由前端 axios baseURL 自动添加）
+    # 添加下载 URL（带 /api/v1 前缀，前端 fetch 直接使用）
     if history.ingest_xml_path:
-        data["ingest_xml_url"] = f"/attachments/download?path={quote(history.ingest_xml_path, safe='')}"
+        data["ingest_xml_url"] = storage_service.get_file_url(history.ingest_xml_path)
     if history.result_xml_path:
-        data["result_xml_url"] = f"/attachments/download?path={quote(history.result_xml_path, safe='')}"
+        data["result_xml_url"] = storage_service.get_file_url(history.result_xml_path)
     return IngestHistoryItem(**data)
 
 
@@ -146,9 +145,9 @@ async def list_ingest_history_details(
             "result_xml_path": history.result_xml_path,
         }
         if history.ingest_xml_path:
-            data["ingest_xml_url"] = f"/attachments/download?path={quote(history.ingest_xml_path, safe='')}"
+            data["ingest_xml_url"] = storage_service.get_file_url(history.ingest_xml_path)
         if history.result_xml_path:
-            data["result_xml_url"] = f"/attachments/download?path={quote(history.result_xml_path, safe='')}"
+            data["result_xml_url"] = storage_service.get_file_url(history.result_xml_path)
         items.append(IngestHistoryDetailItem(**data))
 
     return PaginatedResponse[IngestHistoryDetailItem](

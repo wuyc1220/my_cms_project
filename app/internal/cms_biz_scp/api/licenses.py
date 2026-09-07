@@ -25,7 +25,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.common.dependencies import get_current_user, _get_ip
 from app.common.dependencies import get_db
 from app.internal.cms_biz_system.models.user import User
-from app.internal.cms_biz_scp.models.trade import License
+from app.internal.cms_biz_scp.models.trade import License, LicenseContent
 from app.internal.cms_biz_scp.schemas.trade import (
     ContentAddToLicenseRequest,
     ContentForTradeItem,
@@ -86,8 +86,8 @@ async def create_license_api(
         user_id=current_user.id,
         user_name=current_user.username,
         operation_type=OperationType.LICENSE_CREATE,
-        operation_object=f"LICENSE {body.name}",
-        operation_content="LOG_LICENSE_CREATED",
+        operation_object_code="OBJ_LICENSE", operation_object_params={"name": body.name},
+        operation_content_code="LOG_LICENSE_CREATE", operation_content_params={"name": body.name},
         previous_value=previous_value,
         updated_value=updated_value,
         updated_value_json=updated_value_json,
@@ -107,18 +107,23 @@ async def batch_delete_licenses_api(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    rows = (await db.execute(select(License.name).where(License.id.in_(body.ids), License.is_deleted.is_(False)))).scalars().all()
-    license_names = ", ".join(rows) if rows else str(body.ids)
+    licenses = (await db.execute(select(License).where(License.id.in_(body.ids), License.is_deleted.is_(False)))).scalars().all()
+    license_names = ", ".join([l.name for l in licenses]) if licenses else str(body.ids)
+    prev_data = [orm_to_dict(l) for l in licenses]
+    prev_val, _, raw_val = await prepare_log_values(db, "license", prev_data, None)
     deleted = await license_service.batch_delete_licenses(db, body)
     await write_log(
         db,
         user_id=current_user.id,
         user_name=current_user.username,
         operation_type=OperationType.LICENSE_BATCH_DELETE,
-        operation_object=f"许可证 {license_names}",
-        operation_content=f"批量删除许可证: {license_names}",
+        operation_object_code="OBJ_LICENSE", operation_object_params={"name": license_names},
+        operation_content_code="LOG_LICENSE_BATCH_DELETE", operation_content_params={"names": license_names},
         entity_type="license",
         entity_id=body.ids[0] if body.ids else None,
+        previous_value=prev_val,
+        updated_value=None,
+        updated_value_json=raw_val,
         ip_address=_get_ip(request),
         result="success",
     )
@@ -129,9 +134,9 @@ async def batch_delete_licenses_api(
 @router.get("/without-license-content-count")
 async def get_without_license_content_count(
     db: AsyncSession = Depends(get_db),
-    _: User = Depends(get_current_user),
+    current_user: User = Depends(get_current_user),
 ):
-    count = await license_service.get_without_license_content_count(db)
+    count = await license_service.get_without_license_content_count(db, current_user)
     return {"count": count}
 
 
@@ -162,8 +167,8 @@ async def update_license_api(
         user_id=current_user.id,
         user_name=current_user.username,
         operation_type=OperationType.LICENSE_EDIT,
-        operation_object=f"LICENSE {old.name}",
-        operation_content="LOG_LICENSE_UPDATED",
+        operation_object_code="OBJ_LICENSE", operation_object_params={"name": old.name},
+        operation_content_code="LOG_LICENSE_EDIT", operation_content_params={"name": old.name},
         previous_value=previous_value,
         updated_value=updated_value,
         updated_value_json=updated_value_json,
@@ -193,8 +198,8 @@ async def delete_license_api(
         user_id=current_user.id,
         user_name=current_user.username,
         operation_type=OperationType.LICENSE_DELETE,
-        operation_object=f"LICENSE {license_name}",
-        operation_content="LOG_LICENSE_DELETED",
+        operation_object_code="OBJ_LICENSE", operation_object_params={"name": license_name},
+        operation_content_code="LOG_LICENSE_DELETE", operation_content_params={"name": license_name},
         previous_value=previous_value,
         updated_value=updated_value,
         updated_value_json=updated_value_json,
@@ -213,9 +218,9 @@ async def delete_license_api(
 async def get_license_contents(
     license_id: int,
     db: AsyncSession = Depends(get_db),
-    _: User = Depends(get_current_user),
+    current_user: User = Depends(get_current_user),
 ):
-    return await license_service.list_license_contents(db, license_id)
+    return await license_service.list_license_contents(db, license_id, current_user)
 
 
 @router.post("/{license_id}/contents", response_model=list[ContentForTradeItem])
@@ -226,27 +231,49 @@ async def add_contents_to_license_api(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    result = await license_service.add_contents_to_license(db, license_id, body)
+    # 查询调用前已关联的内容，仅对本次实际新增的内容写日志
+    # （service 幂等跳过已关联内容，API 日志与其保持一致，重复提交不产生冗余日志）
+    existing_ids = set(
+        (
+            await db.execute(
+                select(LicenseContent.content_id).where(
+                    LicenseContent.license_id == license_id,
+                    LicenseContent.content_id.in_(body.content_ids),
+                    LicenseContent.is_deleted.is_(False),
+                )
+            )
+        ).scalars().all()
+    )
+    result = await license_service.add_contents_to_license(db, license_id, body, current_user)
     import json
     license_obj = await license_service.get_license(db, license_id)
     license_name = license_obj.name if license_obj else str(license_id)
+    raw_val = json.dumps({
+        "license_id": license_id,
+        "license_name": license_name,
+        "content_ids": body.content_ids
+    }, ensure_ascii=False)
     upd_val = json.dumps({"license_name": license_name}, ensure_ascii=False)
-    await write_log(
-        db,
-        user_id=current_user.id,
-        user_name=current_user.username,
-        operation_type=OperationType.LICENSE_CONTENT_ADD,
-        operation_object=f"log.license.link",
-        operation_content="log.license.link",
-        content_id=body.content_ids[0] if body.content_ids else None,
-        entity_type="license",
-        entity_id=license_id,
-        previous_value=None,
-        updated_value=upd_val,
-        updated_value_json=None,
-        ip_address=_get_ip(request),
-        result="success",
-    )
+    # 逐个新增内容写日志（content_id 各自归属），保证每个被直接关联的内容详情页 Activity Log 可见
+    for cid in body.content_ids:
+        if cid in existing_ids:
+            continue
+        await write_log(
+            db,
+            user_id=current_user.id,
+            user_name=current_user.username,
+            operation_type=OperationType.LICENSE_CONTENT_ADD,
+            operation_object_code="log.license.link",
+            operation_content_code="log.license.link",
+            content_id=cid,
+            entity_type="license",
+            entity_id=license_id,
+            previous_value=None,
+            updated_value=upd_val,
+            updated_value_json=raw_val,
+            ip_address=_get_ip(request),
+            result="success",
+        )
     await db.commit()
     return result
 
@@ -262,21 +289,29 @@ async def remove_content_from_license_api(
     import json
     license_obj = await license_service.get_license(db, license_id)
     license_name = license_obj.name if license_obj else str(license_id)
+    raw_val = json.dumps({
+        "license_id": license_id,
+        "license_name": license_name,
+        "content_id": content_id
+    }, ensure_ascii=False)
     prev_val = json.dumps({"license_name": license_name}, ensure_ascii=False)
-    await license_service.remove_content_from_license(db, license_id, content_id)
+    await license_service.remove_content_from_license(
+        db, license_id, content_id,
+        processed_by=current_user.username, current_user=current_user,
+    )
     await write_log(
         db,
         user_id=current_user.id,
         user_name=current_user.username,
         operation_type=OperationType.LICENSE_CONTENT_REMOVE,
-        operation_object=f"log.license.unlink",
-        operation_content="log.license.unlink",
+        operation_object_code="log.license.unlink",
+        operation_content_code="log.license.unlink",
         content_id=content_id,
         entity_type="license",
         entity_id=license_id,
         previous_value=prev_val,
         updated_value=None,
-        updated_value_json=None,
+        updated_value_json=raw_val,
         ip_address=_get_ip(request),
         result="success",
     )
@@ -291,12 +326,12 @@ async def get_unlicensed_contents(
     title: str | None = None,
     content_types: list[str] | None = Query(default=None),
     ingest_statuses: list[str] | None = Query(default=None),
-    genres: list[str] | None = Query(default=None),
+    genre_ids: list[int] | None = Query(default=None),
     db: AsyncSession = Depends(get_db),
-    _: User = Depends(get_current_user),
+    current_user: User = Depends(get_current_user),
 ):
     return await license_service.list_unlicensed_contents(
-        db, page, page_size, title, content_types, ingest_statuses, genres
+        db, page, page_size, title, content_types, ingest_statuses, genre_ids, current_user
     )
 
 
@@ -308,13 +343,13 @@ async def get_available_contents(
     title: str | None = None,
     content_types: list[str] | None = Query(default=None),
     ingest_statuses: list[str] | None = Query(default=None),
-    genres: list[str] | None = Query(default=None),
+    genre_ids: list[int] | None = Query(default=None),
     without_license: bool = False,
     db: AsyncSession = Depends(get_db),
-    _: User = Depends(get_current_user),
+    current_user: User = Depends(get_current_user),
 ):
     return await license_service.list_available_contents(
-        db, license_id, page, page_size, title, content_types, ingest_statuses, genres, without_license
+        db, license_id, page, page_size, title, content_types, ingest_statuses, genre_ids, without_license, current_user
     )
 
 

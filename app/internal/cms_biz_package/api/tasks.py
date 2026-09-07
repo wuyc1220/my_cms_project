@@ -112,8 +112,8 @@ async def assign_task_api(
         user_id=current_user.id,
         user_name=current_user.username,
         operation_type=OperationType.TASK_ASSIGN,
-        operation_object=f"任务 ID={task_id}",
-        operation_content=f"Assigned task: ID={task_id}, assignee_id={body.assignee_id}, update_childs={body.update_childs}",
+        operation_object_code="OBJ_TASK", operation_object_params={"name": task_id},
+        operation_content_code="LOG_TASK_ASSIGN", operation_content_params={"id": task_id, "assignee": new_task.assignee_id},
         previous_value=prev_val,
         updated_value=new_val,
         updated_value_json=raw_val,
@@ -133,6 +133,11 @@ async def batch_assign_tasks_api(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    from sqlalchemy import select
+    from app.internal.cms_biz_package.models.task import Task
+    tasks = (await db.execute(select(Task).where(Task.id.in_(body.task_ids)))).scalars().all()
+    prev_data = [orm_to_dict(t) for t in tasks]
+    prev_val, _, raw_val = await prepare_log_values(db, "task", prev_data, None)
     assigned_count = await task_service.batch_assign_tasks(
         db,
         task_ids=body.task_ids,
@@ -140,15 +145,25 @@ async def batch_assign_tasks_api(
         update_childs=body.update_childs,
         processed_by=current_user.username,
     )
+    import json
+    new_raw_val = json.dumps({
+        "task_ids": body.task_ids,
+        "assignee_id": body.assignee_id,
+        "update_childs": body.update_childs,
+        "assigned_count": assigned_count
+    }, ensure_ascii=False)
     await write_log(
         db,
         user_id=current_user.id,
         user_name=current_user.username,
         operation_type=OperationType.TASK_BATCH_ASSIGN,
-        operation_object=f"任务 {body.task_ids}",
-        operation_content=f"批量分配任务: {body.task_ids}",
+        operation_object_code="OBJ_TASK", operation_object_params={"name": body.task_ids},
+        operation_content_code="LOG_TASK_BATCH_ASSIGN", operation_content_params={"ids": body.task_ids},
         entity_type="task",
         entity_id=body.task_ids[0] if body.task_ids else None,
+        previous_value=prev_val,
+        updated_value=f"批量分配 {assigned_count} 个任务",
+        updated_value_json=new_raw_val,
         ip_address=_get_ip(request),
         result="success",
     )

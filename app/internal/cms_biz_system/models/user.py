@@ -10,9 +10,12 @@ def utcnow():
 
 class User(Base):
     __tablename__ = "cms_user"
+    __table_args__ = (
+        Index("ix_cms_user_username_active", "username", unique=True, postgresql_where=("is_deleted = false")),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    username: Mapped[str] = mapped_column(String(100), unique=True, nullable=False)
+    username: Mapped[str] = mapped_column(String(100), nullable=False)
     password_hash: Mapped[str] = mapped_column(String(200), nullable=False)
     display_name: Mapped[str | None] = mapped_column(String(100), nullable=True)
     email: Mapped[str | None] = mapped_column(String(200), nullable=True)
@@ -23,7 +26,6 @@ class User(Base):
     # 密码相关
     password_changed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     force_change_password: Mapped[bool] = mapped_column(Boolean, default=False)
-    # 登录失败与锁定
     login_fail_count: Mapped[int] = mapped_column(Integer, default=0)
     locked_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)

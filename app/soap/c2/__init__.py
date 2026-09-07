@@ -12,6 +12,8 @@ C2 规范 ADI XML 生成模块。
         xml_str = await builder.build_publish_xml(content_id=123)
 """
 from .builder import ADIBuilder
+from .category_builder import CategorySyncBuilder
+from .package_builder import PackageSyncBuilder
 from .constants import Action, ElementType
 
-__all__ = ["ADIBuilder", "Action", "ElementType"]
+__all__ = ["ADIBuilder", "CategorySyncBuilder", "PackageSyncBuilder", "Action", "ElementType"]

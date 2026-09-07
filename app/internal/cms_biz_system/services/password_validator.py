@@ -4,62 +4,77 @@
 验证规则：
 1. 密码长度 >= 8 位
 2. 必须包含大写字母、小写字母、数字、特殊符号中的至少3种
-3. 禁止连续重复字符（如 aaa, 111）
+3. 禁止连续重复字符（如 aaaaaa, 111111）
 4. 禁止键盘序列（如 qwerty, 123456）
 5. 禁止与账号相同
-6. 禁止常见英文单词/拼音
+
+重复字符/连续字符/键盘序列三个阈值统一由 pattern_min_len 控制（默认 6，可配置）。
 """
 
 import re
+from functools import lru_cache
 from typing import List, Tuple
 from loguru import logger
 
-# 常见弱密码（英文单词 + 拼音）
-COMMON_PASSWORDS = {
-    # 英文单词
-    'password', 'admin', 'root', 'user', 'login', 'welcome', 'hello', 'world',
-    'monkey', 'dragon', 'master', 'letmein', 'qwerty', 'trustno1', 'iloveyou',
-    'sunshine', 'princess', 'football', 'baseball', 'soccer', 'hockey',
-    'batman', 'superman', 'shadow', 'ashley', 'michael', 'jennifer',
-    # 常见拼音
-    'mima', 'wode', 'nihao', 'woaini', 'zhangsan', 'lisi', 'wangwu',
-    'zhaoliu', 'sunqi', 'zhouba', 'wujiu', 'zhengshi', 'ceshi', 'test',
-    'admin123', 'password123', '123456', 'abcdef', 'abc123', 'aaa', 'bbb',
-    'qweasd', 'asdzxc', 'qazwsx', '1q2w3e', 'q1w2e3',
-}
+from app.common.core.i18n import get_msg
 
-# 键盘序列
-KEYBOARD_SEQUENCES = [
-    # 横向序列
-    'qwerty', 'asdfgh', 'zxcvbn', 'qwertyuiop', 'asdfghjkl', 'zxcvbnm',
-    'qazwsx', 'qweasd', 'asdzxc',
-    # 数字序列
-    '123456', '234567', '345678', '456789', '567890',
-    '098765', '987654', '876543', '765432', '654321',
-    # 特殊符号序列
-    '!@#$%^', '@#$%^&', '#$%^&*', '$%^&*(', '%^&*()',
+# 键盘布局：字母行、数字行、符号行、列走位、数字前缀列走位（如 1qaz2wsx 型）
+KEYBOARD_LINES = [
+    'qwertyuiop', 'asdfghjkl', 'zxcvbnm', '1234567890', '!@#$%^&*()',
+    'qazwsx', 'wsxedc', 'edcrfv',                      # 相邻列组合走位
+    '1qaz', '2wsx', '3edc', '4rfv', '5tgb', '6yhn', '7ujm',  # 数字前缀列走位
 ]
 
+# 模式（重复/连续/键盘序列）触发阈值默认值
+PATTERN_MIN_LEN_DEFAULT = 6
 
-def validate_password(password: str, username: str | None = None, min_length: int = 8) -> Tuple[bool, List[str]]:
+
+@lru_cache(maxsize=None)
+def _build_keyboard_sequences(min_len: int) -> frozenset:
+    """基于键盘布局生成所有键盘序列子串（正向 + 反向），按阈值缓存。"""
+    sequences = set()
+    for line in KEYBOARD_LINES:
+        for s in (line, line[::-1]):
+            for n in range(min_len, len(s) + 1):
+                for i in range(len(s) - n + 1):
+                    sequences.add(s[i:i + n])
+    return frozenset(sequences)
+
+
+def _has_consecutive_chars(text: str, min_len: int) -> bool:
+    """检查是否存在 min_len 个及以上连续递增/递减字符（如 abcdef、987654）。"""
+    if min_len < 2:
+        return True
+    for i in range(len(text) - min_len + 1):
+        ords = [ord(c) for c in text[i:i + min_len]]
+        if all(ords[k + 1] - ords[k] == 1 for k in range(len(ords) - 1)):
+            return True
+        if all(ords[k + 1] - ords[k] == -1 for k in range(len(ords) - 1)):
+            return True
+    return False
+
+
+def validate_password(
+    password: str,
+    username: str | None = None,
+    min_length: int = 8,
+    pattern_min_len: int = PATTERN_MIN_LEN_DEFAULT,
+) -> Tuple[bool, List[str]]:
     """
-    验证密码是否符合所有规则。
+    验证密码是否符合规则，命中第一条即返回。
 
     Args:
         password: 待验证的密码
         username: 用户账号（可选，用于检查密码是否与账号相同）
         min_length: 密码最小长度（默认8位）
+        pattern_min_len: 重复字符/连续字符/键盘序列触发阈值（默认6，即6个及以上才拦截）
 
     Returns:
         Tuple[bool, List[str]]: (是否有效, 错误消息列表)
     """
-    errors = []
-
-    # 规则1：长度检查
     if len(password) < min_length:
-        errors.append(f"密码长度不能少于{min_length}位")
+        return False, [get_msg("PASSWORD_TOO_SHORT", min_length=min_length)]
 
-    # 规则2：至少包含3种字符类型
     has_upper = bool(re.search(r'[A-Z]', password))
     has_lower = bool(re.search(r'[a-z]', password))
     has_digit = bool(re.search(r'[0-9]', password))
@@ -67,38 +82,19 @@ def validate_password(password: str, username: str | None = None, min_length: in
 
     type_count = sum([has_upper, has_lower, has_digit, has_special])
     if type_count < 3:
-        errors.append("密码必须包含大写字母、小写字母、数字、特殊符号中的至少3种")
+        return False, [get_msg("PASSWORD_COMPLEXITY")]
 
-    # 规则3：禁止连续重复字符（3个或以上相同字符）
-    if re.search(r'(.)\1{2,}', password):
-        errors.append("密码不能包含连续重复的字符（如aaa、111）")
+    if re.search(rf'(.)\1{{{pattern_min_len - 1},}}', password):
+        return False, [get_msg("PASSWORD_NO_REPEAT")]
 
-    # 规则4：禁止连续序列字符（如abc、123、cba、321）
     lower_pwd = password.lower()
-    for i in range(len(lower_pwd) - 2):
-        # 检查升序序列（abc、123）
-        if ord(lower_pwd[i + 1]) == ord(lower_pwd[i]) + 1 and \
-           ord(lower_pwd[i + 2]) == ord(lower_pwd[i]) + 2:
-            errors.append("密码不能包含连续的字符序列（如abc、123）")
-            break
-        # 检查降序序列（cba、321）
-        if ord(lower_pwd[i + 1]) == ord(lower_pwd[i]) - 1 and \
-           ord(lower_pwd[i + 2]) == ord(lower_pwd[i]) - 2:
-            errors.append("密码不能包含连续的字符序列（如cba、321）")
-            break
+    if _has_consecutive_chars(lower_pwd, pattern_min_len):
+        return False, [get_msg("PASSWORD_NO_SEQUENCE")]
 
-    # 规则5：密码不能与账号相同
     if username and lower_pwd == username.lower():
-        errors.append("密码不能与账号相同")
+        return False, [get_msg("PASSWORD_NOT_USERNAME")]
 
-    # 规则6：禁止常见英文单词/拼音
-    if lower_pwd in COMMON_PASSWORDS:
-        errors.append("密码过于简单，不能使用常见单词或拼音")
+    if any(seq in lower_pwd for seq in _build_keyboard_sequences(pattern_min_len)):
+        return False, [get_msg("PASSWORD_NO_KEYBOARD")]
 
-    # 规则7：禁止键盘序列
-    for seq in KEYBOARD_SEQUENCES:
-        if seq in lower_pwd:
-            errors.append("密码不能包含键盘序列（如qwerty、123456）")
-            break
-
-    return len(errors) == 0, errors
+    return True, []

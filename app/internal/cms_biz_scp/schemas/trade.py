@@ -157,9 +157,11 @@ class ContractAttachmentItem(BaseModel):
     contract_id: int
     file_name: str
     file_path: str
+    relative_path: str | None = None
     file_size: int | None = None
     uploaded_by: int | None = None
     created_at: datetime | None = None
+    url: str | None = None
 
     model_config = ConfigDict(from_attributes=True)
 

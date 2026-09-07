@@ -9,6 +9,8 @@ from app.internal.cms_biz_metada.models.basic import PosterSize
 from app.internal.cms_biz_metada.schemas.basic import (
     EntityFieldValueItem,
     EntityFieldValuesPayload,
+    EntityI18nItem,
+    EntityI18nPayload,
     PosterSizeCreate,
     PosterSizeListItem,
     PosterSizeUpdate,
@@ -25,6 +27,8 @@ from app.internal.cms_biz_metada.services.poster_size_service import (
 from app.internal.cms_biz_metada.services.entity_data_service import (
     get_field_values,
     save_field_values,
+    get_i18n_values,
+    save_i18n_values,
 )
 from app.internal.cms_biz_system.services.operation_log_service import OperationType, write_log
 from app.common.utils.log_enricher import orm_to_dict, prepare_log_values
@@ -73,8 +77,8 @@ async def create_poster_size_api(
         user_id=current_user.id,
         user_name=current_user.username,
         operation_type=OperationType.POSTER_SIZE_CREATE,
-        operation_object=f"海报尺寸 {body.name}",
-        operation_content=f"Created poster size: name={body.name}, width={body.width}, height={body.height}",
+        operation_object_code="OBJ_POSTER_SIZE", operation_object_params={"name": body.name},
+        operation_content_code="LOG_POSTER_SIZE_CREATE", operation_content_params={"name": body.name},
         ip_address=_get_ip(request),
         result="success",
         previous_value=prev_val,
@@ -106,8 +110,8 @@ async def update_poster_size_api(
         user_id=current_user.id,
         user_name=current_user.username,
         operation_type=OperationType.POSTER_SIZE_EDIT,
-        operation_object=f"海报尺寸 {old_name}",
-        operation_content=f"Updated poster size: ID={poster_size_id}, name={ps.name}",
+        operation_object_code="OBJ_POSTER_SIZE", operation_object_params={"name": old_name},
+        operation_content_code="LOG_POSTER_SIZE_EDIT", operation_content_params={"name": ps.name},
         ip_address=_get_ip(request),
         result="success",
         previous_value=prev_val,
@@ -135,8 +139,8 @@ async def batch_delete_poster_sizes_api(
         user_id=current_user.id,
         user_name=current_user.username,
         operation_type=OperationType.POSTER_SIZE_BATCH_DELETE,
-        operation_object=f"海报尺寸 {ps_names}",
-        operation_content=f"批量删除海报尺寸: {ps_names}",
+        operation_object_code="OBJ_POSTER_SIZE", operation_object_params={"name": ps_names},
+        operation_content_code="LOG_POSTER_SIZE_BATCH_DELETE", operation_content_params={"names": ps_names},
         ip_address=_get_ip(request),
         result="success",
         entity_type="poster_size",
@@ -163,8 +167,8 @@ async def delete_poster_size_api(
         user_id=current_user.id,
         user_name=current_user.username,
         operation_type=OperationType.POSTER_SIZE_DELETE,
-        operation_object=f"海报尺寸 {ps_name}",
-        operation_content=f"Deleted poster size: ID={poster_size_id}, name={ps_name}",
+        operation_object_code="OBJ_POSTER_SIZE", operation_object_params={"name": ps_name},
+        operation_content_code="LOG_POSTER_SIZE_DELETE", operation_content_params={"name": ps_name},
         ip_address=_get_ip(request),
         result="success",
         previous_value=prev_val,
@@ -198,6 +202,31 @@ async def save_poster_size_field_values(
 ):
     await get_poster_size(db, poster_size_id)
     return await save_field_values(db, ENTITY_TYPE, poster_size_id, body)
+
+
+# ---------- Multi-Language Values ----------
+
+@router.get("/{poster_size_id}/i18n", response_model=list[EntityI18nItem])
+async def get_poster_size_i18n(
+    poster_size_id: int,
+    db: AsyncSession = Depends(get_db),
+    _: User = Depends(get_current_user),
+):
+    """查询单个海报规格的多语言字段值。"""
+    await get_poster_size(db, poster_size_id)
+    return await get_i18n_values(db, ENTITY_TYPE, poster_size_id)
+
+
+@router.put("/{poster_size_id}/i18n", response_model=list[EntityI18nItem])
+async def save_poster_size_i18n(
+    poster_size_id: int,
+    body: EntityI18nPayload,
+    db: AsyncSession = Depends(get_db),
+    _: User = Depends(get_current_user),
+):
+    """保存单个海报规格的多语言字段值。"""
+    await get_poster_size(db, poster_size_id)
+    return await save_i18n_values(db, ENTITY_TYPE, poster_size_id, body)
 
 
 @router.get("/{poster_size_id}/history")

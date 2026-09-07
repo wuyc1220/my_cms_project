@@ -17,10 +17,12 @@
 from typing import Optional
 
 from fastapi import APIRouter, Depends, Query, Request, UploadFile
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.common.dependencies import _get_ip, get_current_user, get_db
 from app.common.schemas import BatchDeleteRequest, PaginatedResponse
+from app.internal.cms_biz_system.models.metadata_validation_rule import MetadataValidationRule
 from app.internal.cms_biz_system.models.user import User
 from app.internal.cms_biz_system.schemas.metadata_validation_rule import (
     MetadataValidationRuleCreate,
@@ -106,11 +108,9 @@ async def api_create_validation_rule(
         user_id=current_user.id,
         user_name=current_user.username,
         operation_type=OperationType.VALIDATION_RULE_CREATE,
-        operation_object=f"校验规则 {rule.entity_type}.{rule.field_name}",
-        operation_content=(
-            f"Created validation rule: entity_type={rule.entity_type}, "
-            f"field_name={rule.field_name}, rule_type={rule.rule_type}"
-        ),
+        operation_object_code="OBJ_VALIDATION_RULE", operation_object_params={"name": rule.entity_type},
+        operation_content_code="LOG_VALIDATION_RULE_CREATE",
+        operation_content_params={"name": f"{rule.entity_type}.{rule.field_name}"},
         ip_address=_get_ip(request),
         result="success",
         previous_value=prev_val,
@@ -143,11 +143,9 @@ async def api_update_validation_rule(
         user_id=current_user.id,
         user_name=current_user.username,
         operation_type=OperationType.VALIDATION_RULE_EDIT,
-        operation_object=f"校验规则 {rule.entity_type}.{rule.field_name}",
-        operation_content=(
-            f"Updated validation rule: id={rule_id}, "
-            f"entity_type={rule.entity_type}, field_name={rule.field_name}"
-        ),
+        operation_object_code="OBJ_VALIDATION_RULE", operation_object_params={"name": rule.entity_type},
+        operation_content_code="LOG_VALIDATION_RULE_EDIT",
+        operation_content_params={"name": f"{rule.entity_type}.{rule.field_name}"},
         ip_address=_get_ip(request),
         result="success",
         previous_value=prev_val,
@@ -178,8 +176,8 @@ async def api_delete_validation_rule(
         user_id=current_user.id,
         user_name=current_user.username,
         operation_type=OperationType.VALIDATION_RULE_DELETE,
-        operation_object=f"校验规则 {rule.entity_type}.{rule.field_name}",
-        operation_content=f"Deleted validation rule: id={rule_id}",
+        operation_object_code="OBJ_VALIDATION_RULE", operation_object_params={"name": rule.entity_type},
+        operation_content_code="LOG_VALIDATION_RULE_DELETE", operation_content_params={"id": rule_id},
         ip_address=_get_ip(request),
         result="success",
         previous_value=prev_val,
@@ -201,17 +199,25 @@ async def api_batch_delete_validation_rules(
     current_user: User = Depends(get_current_user),
 ):
     """批量删除校验规则。"""
+    rules = (await db.execute(select(MetadataValidationRule).where(MetadataValidationRule.id.in_(body.ids), MetadataValidationRule.is_deleted.is_(False)))).scalars().all()
+    rule_names = ", ".join([f"{r.entity_type}.{r.field_name}" for r in rules]) if rules else str(body.ids)
+    prev_data = [orm_to_dict(r) for r in rules]
+    prev_val, _, raw_val = await prepare_log_values(db, "validation_rule", prev_data, None)
     deleted_count = await batch_delete_validation_rules(db, body.ids)
     await write_log(
         db,
         user_id=current_user.id,
         user_name=current_user.username,
         operation_type=OperationType.VALIDATION_RULE_BATCH_DELETE,
-        operation_object=f"校验规则 {body.ids}",
-        operation_content=f"批量删除校验规则: {body.ids}",
+        operation_object_code="OBJ_VALIDATION_RULE", operation_object_params={"name": rule_names},
+        operation_content_code="LOG_VALIDATION_RULE_BATCH_DELETE", operation_content_params={"names": rule_names},
         ip_address=_get_ip(request),
         result="success",
         entity_type="validation_rule",
+        entity_id=body.ids[0] if body.ids else None,
+        previous_value=prev_val,
+        updated_value=None,
+        updated_value_json=raw_val,
     )
     await db.commit()
     
@@ -233,12 +239,14 @@ async def api_import_rules_from_excel(
         user_id=current_user.id,
         user_name=current_user.username,
         operation_type=OperationType.VALIDATION_RULE_IMPORT,
-        operation_object=f"导入校验规则 {file.filename}",
-        operation_content=(
-            f"Imported validation rules from Excel: "
-            f"total={result.total}, created={result.created}, "
-            f"updated={result.updated}, failed={result.failed}"
-        ),
+        operation_object_code="OBJ_VALIDATION_RULE_IMPORT", operation_object_params={"name": file.filename},
+        operation_content_code="LOG_VALIDATION_RULE_IMPORT",
+        operation_content_params={
+            "result": (
+                f"total={result.total}, created={result.created}, "
+                f"updated={result.updated}, failed={result.failed}"
+            )
+        },
         ip_address=_get_ip(request),
         result="success",
         entity_type="validation_rule",

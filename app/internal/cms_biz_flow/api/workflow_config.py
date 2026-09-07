@@ -73,8 +73,8 @@ async def create_workflow_config(
         user_id=current_user.id,
         user_name=current_user.username,
         operation_type=OperationType.WORKFLOW_CREATE,
-        operation_object=f"创建工作流配置 {data.process_code}",
-        operation_content=f"Create workflow config: {data.process_code}",
+        operation_object_code="OBJ_WORKFLOW_CONFIG", operation_object_params={"name": data.process_code},
+            operation_content_code="LOG_WORKFLOW_CREATE", operation_content_params={"code": data.process_code},
         ip_address=_get_ip(request),
         result="success",
         previous_value=prev_val,
@@ -105,18 +105,25 @@ async def update_workflow_config(
     current_user: User = Depends(get_current_user),
 ):
     """更新流程配置。"""
+    old = await workflow_config_service.get_workflow_config(db, config_id)
+    old_data = orm_to_dict(old) if old else None
     result = await workflow_config_service.update_workflow_config(db, config_id, data, current_user.id)
+    new_data = orm_to_dict(result) if result else None
+    prev_val, new_val, raw_val = await prepare_log_values(db, "workflow_config", old_data, new_data)
     await write_log(
         db,
         user_id=current_user.id,
         user_name=current_user.username,
         operation_type=OperationType.WORKFLOW_EDIT,
-        operation_object=f"更新工作流配置 #{config_id}",
-        operation_content=f"Update workflow config: {config_id}",
+        operation_object_code="OBJ_WORKFLOW_CONFIG", operation_object_params={"name": config_id},
+            operation_content_code="LOG_WORKFLOW_EDIT", operation_content_params={"id": config_id},
         ip_address=_get_ip(request),
         result="success",
         entity_type="workflow_config",
         entity_id=config_id,
+        previous_value=prev_val,
+        updated_value=new_val,
+        updated_value_json=raw_val,
     )
     await db.commit()
     return result
@@ -130,18 +137,24 @@ async def delete_workflow_config(
     current_user: User = Depends(get_current_user),
 ):
     """删除流程配置。"""
+    old = await workflow_config_service.get_workflow_config(db, config_id)
+    old_data = orm_to_dict(old) if old else None
+    prev_val, _, raw_val = await prepare_log_values(db, "workflow_config", old_data, None)
     success = await workflow_config_service.delete_workflow_config(db, config_id)
     await write_log(
         db,
         user_id=current_user.id,
         user_name=current_user.username,
         operation_type=OperationType.WORKFLOW_DELETE,
-        operation_object=f"删除工作流配置 #{config_id}",
-        operation_content=f"Delete workflow config: {config_id}",
+        operation_object_code="OBJ_WORKFLOW_CONFIG", operation_object_params={"name": config_id},
+            operation_content_code="LOG_WORKFLOW_DELETE", operation_content_params={"id": config_id},
         ip_address=_get_ip(request),
         result="success" if success else "failure",
         entity_type="workflow_config",
         entity_id=config_id,
+        previous_value=prev_val,
+        updated_value=None,
+        updated_value_json=raw_val,
     )
     await db.commit()
     return {"success": success}
@@ -155,18 +168,25 @@ async def publish_workflow_config(
     current_user: User = Depends(get_current_user),
 ):
     """发布流程配置。"""
+    old = await workflow_config_service.get_workflow_config(db, config_id)
+    old_data = orm_to_dict(old) if old else None
     result = await workflow_config_service.publish_workflow_config(db, config_id, current_user.id)
+    new_data = orm_to_dict(result) if result else None
+    prev_val, new_val, raw_val = await prepare_log_values(db, "workflow_config", old_data, new_data)
     await write_log(
         db,
         user_id=current_user.id,
         user_name=current_user.username,
         operation_type=OperationType.WORKFLOW_PUBLISH,
-        operation_object=f"发布工作流配置 #{config_id}",
-        operation_content=f"Publish workflow config: {config_id}",
+        operation_object_code="OBJ_PUBLISH_BATCH", operation_object_params={"name": config_id},
+            operation_content_code="LOG_WORKFLOW_PUBLISH", operation_content_params={"id": config_id},
         ip_address=_get_ip(request),
         result="success",
         entity_type="workflow_config",
         entity_id=config_id,
+        previous_value=prev_val,
+        updated_value=new_val,
+        updated_value_json=raw_val,
     )
     await db.commit()
     return result
@@ -180,18 +200,25 @@ async def unpublish_workflow_config(
     current_user: User = Depends(get_current_user),
 ):
     """取消发布流程配置。"""
+    old = await workflow_config_service.get_workflow_config(db, config_id)
+    old_data = orm_to_dict(old) if old else None
     result = await workflow_config_service.unpublish_workflow_config(db, config_id, current_user.id)
+    new_data = orm_to_dict(result) if result else None
+    prev_val, new_val, raw_val = await prepare_log_values(db, "workflow_config", old_data, new_data)
     await write_log(
         db,
         user_id=current_user.id,
         user_name=current_user.username,
         operation_type=OperationType.WORKFLOW_UNPUBLISH,
-        operation_object=f"取消发布工作流配置 #{config_id}",
-        operation_content=f"Unpublish workflow config: {config_id}",
+        operation_object_code="OBJ_WORKFLOW_CONFIG", operation_object_params={"name": config_id},
+            operation_content_code="LOG_WORKFLOW_UNPUBLISH", operation_content_params={"id": config_id},
         ip_address=_get_ip(request),
         result="success",
         entity_type="workflow_config",
         entity_id=config_id,
+        previous_value=prev_val,
+        updated_value=new_val,
+        updated_value_json=raw_val,
     )
     await db.commit()
     return result
@@ -205,18 +232,25 @@ async def create_new_version(
     current_user: User = Depends(get_current_user),
 ):
     """基于当前配置创建新草稿版本。"""
+    old = await workflow_config_service.get_workflow_config(db, config_id)
+    old_data = orm_to_dict(old) if old else None
     result = await workflow_config_service.create_new_version(db, config_id, current_user.id)
+    new_data = orm_to_dict(result) if result else None
+    prev_val, new_val, raw_val = await prepare_log_values(db, "workflow_config", old_data, new_data)
     await write_log(
         db,
         user_id=current_user.id,
         user_name=current_user.username,
         operation_type=OperationType.WORKFLOW_NEW_VERSION,
-        operation_object=f"创建工作流配置新版本 #{config_id}",
-        operation_content=f"Create new version for workflow config: {config_id}",
+        operation_object_code="OBJ_WORKFLOW_VERSION", operation_object_params={"name": config_id},
+            operation_content_code="LOG_WORKFLOW_NEW_VERSION", operation_content_params={"id": config_id},
         ip_address=_get_ip(request),
         result="success",
         entity_type="workflow_config",
         entity_id=config_id,
+        previous_value=prev_val,
+        updated_value=new_val,
+        updated_value_json=raw_val,
     )
     await db.commit()
     return result
@@ -240,17 +274,23 @@ async def batch_publish_workflow_configs(
     current_user: User = Depends(get_current_user),
 ):
     """批量发布流程配置。"""
+    import json
+    raw_val = json.dumps({"config_ids": config_ids}, ensure_ascii=False)
     results = await workflow_config_service.batch_publish(db, config_ids, current_user.id)
     await write_log(
         db,
         user_id=current_user.id,
         user_name=current_user.username,
         operation_type=OperationType.WORKFLOW_BATCH_PUBLISH,
-        operation_object=f"工作流配置 {config_ids}",
-        operation_content=f"批量发布工作流配置: {config_ids}",
+        operation_object_code="OBJ_WORKFLOW", operation_object_params={"name": config_ids},
+            operation_content_code="LOG_WORKFLOW_BATCH_PUBLISH", operation_content_params={"ids": config_ids},
         ip_address=_get_ip(request),
         result="success",
         entity_type="workflow_config",
+        entity_id=config_ids[0] if config_ids else None,
+        previous_value=None,
+        updated_value=f"批量发布 {len(config_ids)} 个工作流配置",
+        updated_value_json=raw_val,
     )
     await db.commit()
     return results

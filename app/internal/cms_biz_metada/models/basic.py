@@ -224,6 +224,7 @@ class Picture(Base):
     poster_size_id: Mapped[int] = mapped_column(ForeignKey("poster_size.id", ondelete="CASCADE"), nullable=False)
     file_name: Mapped[str] = mapped_column(String(500), nullable=False)
     file_path: Mapped[str] = mapped_column(String(1000), nullable=False)
+    relative_path: Mapped[str | None] = mapped_column(String(1000), nullable=True, comment="文件相对路径，用于下载")
     file_size: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     width: Mapped[int | None] = mapped_column(Integer, nullable=True)
     height: Mapped[int | None] = mapped_column(Integer, nullable=True)
@@ -233,6 +234,15 @@ class Picture(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
     created_by: Mapped[int | None] = mapped_column(ForeignKey("cms_user.id", ondelete="SET NULL"), nullable=True)
     updated_by: Mapped[int | None] = mapped_column(ForeignKey("cms_user.id", ondelete="SET NULL"), nullable=True)
+
+    # 发布状态相关字段
+    ingest_status: Mapped[str] = mapped_column(
+        String(50),
+        nullable=False,
+        default="none",
+        server_default="none",
+        comment="海报注入状态：none-未发布, processing-发布中, success-发布成功, failed-发布失败"
+    )
 
     poster_size: Mapped["PosterSize"] = relationship("PosterSize", lazy="selectin")
 

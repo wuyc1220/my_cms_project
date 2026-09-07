@@ -22,6 +22,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.common.core.exceptions import BusinessException, ErrorCode
 from app.common.core.i18n import get_msg
+from app.internal.cms_biz_package.models.package import ContentGenre
 from app.internal.cms_biz_system.services.metadata_validation_rule_service import (
     get_rules_by_entity_type,
 )
@@ -92,21 +93,12 @@ async def validate_content_for_c2(
     
     logger.info(f"开始校验 Content {content_id} (type={ctx.content.content_type})")
     
-    # 2. 决定 Action（REGIST/UPDATE/DELETE）
     content_type = ctx.content.content_type
-    action = _decide_action_for_content(ctx)
-    
-    # 3. 只校验 REGIST（首次发布）
-    if action != Action.REGIST:
-        logger.info(f"Action={action.value}，跳过校验（仅 REGIST 需要校验）")
-        return result
-    
-    logger.info(f"Action=REGIST，开始完整校验")
     
     # 4. 根据 content_type 分支校验
     if content_type in ("MOVIE", "EPISODE"):
         await _validate_program_scope(db, ctx, result)
-    elif content_type in ("SERIES", "SEASON"):
+    elif content_type in ("SERIES", "SEASON_SERIES", "SEASON"):
         await _validate_series_scope(db, ctx, result)
     elif content_type == "CHANNEL":
         await _validate_channel_scope(db, ctx, result)
@@ -125,26 +117,6 @@ async def validate_content_for_c2(
         )
     
     return result
-
-
-# ═══════════════════════════════════════════════════════════
-# Action 判断
-# ═══════════════════════════════════════════════════════════
-
-def _decide_action_for_content(ctx: BuildContext) -> Action:
-    """
-    判断 Content 的 Action（REGIST/UPDATE/DELETE）。
-    
-    逻辑：
-        - ingest_status 为 None 或 'failure' → REGIST（首次发布）
-        - ingest_status 为 'success' → UPDATE（更新已发布内容）
-    """
-    ingest_status = ctx.content.ingest_status
-    
-    if ingest_status in (None, "failure"):
-        return Action.REGIST
-    else:
-        return Action.UPDATE
 
 
 # ═══════════════════════════════════════════════════════════
@@ -430,12 +402,22 @@ async def _inject_genre_id(
     content_id: int,
     data_dict: dict,
 ):
-    """从 content 主表注入 genre_id"""
-    from app.internal.cms_biz_orchestration.repositories import get_content_by_id
+    """从 content_genre 中间表注入 genre_id 和 genre_ids"""
+    from sqlalchemy import select
     
-    content = await get_content_by_id(db, content_id)
-    if content and hasattr(content, 'genre_id') and content.genre_id is not None:
-        # 用户提交的优先
-        data_dict['genre_id'] = data_dict.get('genre_id') or content.genre_id
-        logger.debug(f"从 content 主表获取 genre_id={content.genre_id}")
+    stmt = select(ContentGenre.genre_id).where(
+        ContentGenre.content_id == content_id,
+        ContentGenre.is_deleted.is_(False),
+    )
+    rows = (await db.execute(stmt)).all()
+    genre_ids = [r[0] for r in rows]
+    if genre_ids:
+        # 用户提交的优先，未提交则从中间表获取
+        # 同时设置 genre_id（单数，取第一个值）和 genre_ids（复数，完整列表）
+        if not data_dict.get('genre_ids'):
+            data_dict['genre_ids'] = genre_ids
+            logger.debug(f"从 content_genre 中间表获取 genre_ids={genre_ids}")
+        if not data_dict.get('genre_id') and genre_ids:
+            data_dict['genre_id'] = genre_ids[0]
+            logger.debug(f"从 content_genre 中间表获取 genre_id={genre_ids[0]}")
 

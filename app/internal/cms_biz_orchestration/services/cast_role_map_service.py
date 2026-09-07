@@ -22,6 +22,7 @@ from app.internal.cms_biz_orchestration.schemas.cast_role_map import (
 )
 from app.internal.cms_biz_orchestration.services.workflow_service import (
     complete_process_and_update_status,
+    rollback_after_published_edit,
 )
 
 
@@ -40,7 +41,7 @@ async def get_cast_role_map(db: AsyncSession, map_id: int) -> CastRoleMapItem:
         # 查询 Cast 的海报
         pic = (
             await db.execute(
-                select(Picture.file_path)
+                select(Picture.file_path, Picture.relative_path)
                 .where(
                     Picture.entity_type.in_(["cast", "Cast"]),
                     Picture.entity_id == cast_role_map.cast_id,
@@ -49,9 +50,9 @@ async def get_cast_role_map(db: AsyncSession, map_id: int) -> CastRoleMapItem:
                 .order_by(Picture.created_at)
                 .limit(1)
             )
-        ).scalar_one_or_none()
+        ).one_or_none()
         if pic:
-            item.cast_poster_url = storage_service.get_file_url(pic)
+            item.cast_poster_url = storage_service.get_file_url(pic.file_path, pic.relative_path)
     return item
 
 
@@ -86,7 +87,7 @@ async def list_cast_role_maps(
             # 查询 Cast 的海报
             pic = (
                 await db.execute(
-                    select(Picture.file_path)
+                    select(Picture.file_path, Picture.relative_path)
                     .where(
                         Picture.entity_type.in_(["cast", "Cast"]),
                         Picture.entity_id == i.cast_id,
@@ -95,9 +96,9 @@ async def list_cast_role_maps(
                     .order_by(Picture.created_at)
                     .limit(1)
                 )
-            ).scalar_one_or_none()
+            ).one_or_none()
             if pic:
-                item.cast_poster_url = storage_service.get_file_url(pic)
+                item.cast_poster_url = storage_service.get_file_url(pic.file_path, pic.relative_path)
         result_items.append(item)
     return CastRoleMapListItem(
         items=result_items,
@@ -129,6 +130,14 @@ async def create_cast_role_map(
         from app.internal.cms_biz_package.models.package import Content
         content = (await db.execute(select(Content).where(Content.id == data.content_id))).scalar_one_or_none()
         if content:
+            # 已发布/已下架内容编辑后回滚状态并新建提交审核记录（与 Metadata 编辑行为一致）
+            await rollback_after_published_edit(
+                db,
+                content_id=data.content_id,
+                content_type=content.content_type,
+                edited_by=processed_by or "system",
+                edit_info="添加演员角色",
+            )
             await complete_process_and_update_status(
                 db,
                 content_id=data.content_id,
@@ -170,6 +179,14 @@ async def batch_create_cast_role_maps(
         content = (await db.execute(select(Content).where(Content.id == content_id))).scalar_one_or_none()
         if content:
             content_type = content.content_type
+            # 已发布/已下架内容编辑后回滚状态并新建提交审核记录（与 Metadata 编辑行为一致）
+            await rollback_after_published_edit(
+                db,
+                content_id=content_id,
+                content_type=content_type,
+                edited_by=processed_by or "system",
+                edit_info="批量添加演员角色",
+            )
             await complete_process_and_update_status(
                 db,
                 content_id=content_id,
@@ -209,6 +226,14 @@ async def delete_cast_role_map(db: AsyncSession, map_id: int, processed_by: str 
         from app.internal.cms_biz_package.models.package import Content
         content = (await db.execute(select(Content).where(Content.id == cast_role_map.content_id))).scalar_one_or_none()
         if content:
+            # 已发布/已下架内容编辑后回滚状态并新建提交审核记录（与 Metadata 编辑行为一致）
+            await rollback_after_published_edit(
+                db,
+                content_id=cast_role_map.content_id,
+                content_type=content.content_type,
+                edited_by=processed_by or "system",
+                edit_info="删除演员角色",
+            )
             await complete_process_and_update_status(
                 db,
                 content_id=cast_role_map.content_id,

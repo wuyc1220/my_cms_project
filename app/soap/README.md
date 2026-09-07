@@ -48,11 +48,11 @@ SOAP_LSP_ID=ZTE-MW-001
 # LSP SOAP WSDL 地址（由 LSP 提供）
 SOAP_LSP_SOAP_URL=http://lsp-server.com/soap/wsdl
 
-# XML 文件本地存储路径
-SOAP_XML_STORAGE_PATH=./soap_commands
-
-# XML 文件访问 URL（LSP 需能访问）
-SOAP_XML_BASE_URL=http://cms-server.com/commands
+# XML 文件 FTP/SFTP 路径前缀（LSP 通过 FTP/SFTP 下载 XML 文件）
+# 格式: ftp://user:password@host:port/base_path
+# 示例: ftp://zxin10:os10+ZTE@80.80.134.134:21/home/zxin10/cms
+# 如果未设置，将使用 storage_type 配置的 FTP/SFTP 连接信息
+SOAP_CMD_FILE_URL_PREFIX=
 
 # 超时和重试配置
 SOAP_TIMEOUT=30
@@ -130,8 +130,7 @@ GET /commands/{filename}
 | SOAP_CSP_ID | CSP 标识 | SAAT-CMS-001 | 是 |
 | SOAP_LSP_ID | LSP 标识 | ZTE-MW-001 | 是 |
 | SOAP_LSP_SOAP_URL | LSP WSDL 地址 | - | 是 |
-| SOAP_XML_STORAGE_PATH | XML 存储路径 | ./soap_commands | 否 |
-| SOAP_XML_BASE_URL | XML 访问 URL | - | 是 |
+| SOAP_CMD_FILE_URL_PREFIX | XML 文件 FTP/SFTP 路径前缀 | - | 否（使用 storage_type 配置） |
 | SOAP_TIMEOUT | 请求超时（秒） | 30 | 否 |
 | SOAP_MAX_RETRIES | 重试次数 | 3 | 否 |
 | SOAP_RETRY_DELAY | 重试延迟（秒） | 5 | 否 |
@@ -176,8 +175,8 @@ def generate_custom_xml(self, content_id: str, **kwargs) -> str:
 
 ## 注意事项
 
-1. **网络配置**：确保 LSP 能访问 `SOAP_XML_BASE_URL`
-2. **安全配置**：生产环境建议使用 HTTPS
+1. **网络配置**：确保 LSP 能访问 FTP/SFTP 服务器下载 XML 文件
+2. **安全配置**：生产环境建议使用 SFTP
 3. **状态跟踪**：保存 CorrelateID 到数据库，用于关联结果通知
 4. **错误处理**：所有方法都返回统一的结果字典，包含 success 字段
 
@@ -212,7 +211,8 @@ def generate_custom_xml(self, content_id: str, **kwargs) -> str:
 │  │                    │                                              │     │
 │  │                    ▼                                              │     │
 │  │  3. 构造 XML 文件 URL                                             │     │
-│  │     {SOAP_XML_BASE_URL}/{publish_contentId_timestamp.xml}        │     │
+│  │     {SOAP_CMD_FILE_URL_PREFIX}/{publish_contentId_timestamp.xml} │     │
+│  │     或 FTP/SFTP 自动拼接                                           │     │
 │  │                    │                                              │     │
 │  │                    ▼                                              │     │
 │  │  4. 生成 CorrelateID (UUID)                                       │     │

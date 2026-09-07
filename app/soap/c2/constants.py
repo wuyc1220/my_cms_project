@@ -21,7 +21,7 @@ class ElementType(str, Enum):
     与 CMS 模型的对应关系：
         PROGRAM          → Content (content_type = MOVIE / EPISODE) + ContentMetadata
         MOVIE            → Movie
-        SERIES           → Content (content_type = SERIES / SEASON) + SeriesMetadata
+        SERIES           → Content (content_type = SERIES / SEASON_SERIES / SEASON) + SeriesMetadata
         SCHEDULE         → Content (content_type = SCHEDULE) + ScheduleMetadata
         CHANNEL          → Content (content_type = CHANNEL) + ChannelMetadata
         PHYSICAL_CHANNEL → PhysicalChannel
@@ -50,18 +50,14 @@ class ElementType(str, Enum):
 # ═══════════════════════════════════════════════════════════
 class Action(str, Enum):
     """
-    C2 规范 Object Action，共 4 种。
+    C2 规范 Object Action，共 2 种。
 
-    REGIST: 首次注入，需携带完整属性
-    UPDATE: 增量更新，仅携带变更字段（本实现为简化起见仍携带全量属性）
+    REGIST: 全量注入，携带完整属性；下游根据 ID 是否存在自行判断新增/更新
     DELETE: 删除对象，仅需 ElementType + ID；LSP 会级联删除相关 Mapping
-    SKIP:   对象自上次发布后无变更，跳过 Object 输出，仅生成 Mapping
     """
 
     REGIST = "REGIST"
-    UPDATE = "UPDATE"
     DELETE = "DELETE"
-    SKIP = "SKIP"
 
 
 # ═══════════════════════════════════════════════════════════
@@ -72,6 +68,7 @@ CONTENT_TYPE_TO_ELEMENT: dict[str, ElementType] = {
     "MOVIE": ElementType.PROGRAM,
     "EPISODE": ElementType.PROGRAM,
     "SERIES": ElementType.SERIES,
+    "SEASON_SERIES": ElementType.SERIES,
     "SEASON": ElementType.SERIES,
     "CHANNEL": ElementType.CHANNEL,
     "SCHEDULE": ElementType.SCHEDULE,
@@ -87,6 +84,7 @@ PICTURE_ENTITY_TYPE_TO_ELEMENT: dict[str, ElementType] = {
     "cast": ElementType.CAST,
     "program": ElementType.PROGRAM,
     "series": ElementType.SERIES,
+    "season_series": ElementType.SERIES,
     "channel": ElementType.CHANNEL,
     "schedule": ElementType.SCHEDULE,
     "movie": ElementType.PROGRAM,
@@ -96,7 +94,7 @@ PICTURE_ENTITY_TYPE_TO_ELEMENT: dict[str, ElementType] = {
 
 
 # ═══════════════════════════════════════════════════════════
-# 5. 合法 Mapping 父子组合矩阵（13 种）
+# 5. 合法 Mapping 父子组合矩阵（15 种，严格遵循 C2 规范）
 # ═══════════════════════════════════════════════════════════
 # 用于 Mapping 构建时的合法性校验；违反则静默丢弃并记录告警。
 VALID_MAPPINGS: set[tuple[ElementType, ElementType]] = {
@@ -107,6 +105,7 @@ VALID_MAPPINGS: set[tuple[ElementType, ElementType]] = {
     # Package 作为父
     (ElementType.PACKAGE, ElementType.PROGRAM),
     (ElementType.PACKAGE, ElementType.SERIES),
+    (ElementType.PACKAGE, ElementType.CHANNEL),
     # Series 作为父
     (ElementType.SERIES, ElementType.PROGRAM),
     (ElementType.SERIES, ElementType.MOVIE),
@@ -114,15 +113,11 @@ VALID_MAPPINGS: set[tuple[ElementType, ElementType]] = {
     # Program 作为父
     (ElementType.PROGRAM, ElementType.MOVIE),
     (ElementType.PROGRAM, ElementType.CAST_ROLE_MAP),
-    # Picture 作为父（Picture → 任意业务对象）
+    # Picture 作为父
     (ElementType.PICTURE, ElementType.CATEGORY),
     (ElementType.PICTURE, ElementType.PROGRAM),
     (ElementType.PICTURE, ElementType.SERIES),
-    (ElementType.PICTURE, ElementType.CHANNEL),
     (ElementType.PICTURE, ElementType.CAST),
-    # Channel 作为父
-    (ElementType.CHANNEL, ElementType.PHYSICAL_CHANNEL),
-    (ElementType.CHANNEL, ElementType.SCHEDULE),
 }
 
 

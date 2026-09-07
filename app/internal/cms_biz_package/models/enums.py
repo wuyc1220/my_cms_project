@@ -12,6 +12,7 @@ class ContentType(str, Enum):
     MOVIE = "MOVIE"
     EPISODE = "EPISODE"
     SERIES = "SERIES"
+    SEASON_SERIES = "SEASON_SERIES"
     SEASON = "SEASON"
     CHANNEL = "CHANNEL"
     SCHEDULE = "SCHEDULE"

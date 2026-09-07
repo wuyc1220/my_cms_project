@@ -37,11 +37,42 @@ async def get_latest_task_by_entity(
         .where(
             PublishTask.entity_type == entity_type,
             PublishTask.entity_id == entity_id,
-            PublishTask.is_deleted.is_(False)
+            PublishTask.is_deleted.is_(False),
         )
         .order_by(PublishTask.created_at.desc())
         .limit(1)
     )).scalar_one_or_none()
+
+
+async def has_successful_publish_before(
+    db: AsyncSession,
+    entity_id: int,
+    before: datetime,
+    after: Optional[datetime] = None,
+    exclude_task_ids: Optional[list[int]] = None,
+) -> bool:
+    """判断内容在指定时间点之前是否存在成功执行的发布任务
+
+    仅统计 task_type=publish 且 publish_status=success 的任务（创建计划不算）；
+    after 为可选的历史重置边界（内容被编辑回滚后仅统计该时间点之后的成功发布）；
+    exclude_task_ids 用于排除流程记录自身对应的发布任务（避免首次发布自证"之前已发布"）。
+    """
+    conditions = [
+        PublishTask.entity_type == "Content",
+        PublishTask.entity_id == entity_id,
+        PublishTask.task_type == "publish",
+        PublishTask.publish_status == "success",
+        PublishTask.publish_time.is_not(None),
+        PublishTask.publish_time < before,
+        PublishTask.is_deleted.is_(False),
+    ]
+    if after is not None:
+        conditions.append(PublishTask.publish_time > after)
+    if exclude_task_ids:
+        conditions.append(PublishTask.id.not_in(exclude_task_ids))
+    return (await db.execute(
+        select(PublishTask.id).where(*conditions).limit(1)
+    )).scalar_one_or_none() is not None
 
 
 async def list_publish_tasks(
@@ -57,29 +88,41 @@ async def list_publish_tasks(
     publish_time_to: Optional[str] = None,
     unpublish_time_from: Optional[str] = None,
     unpublish_time_to: Optional[str] = None,
+    sort_by: Optional[str] = None,
+    sort_order: Optional[str] = None,
 ) -> tuple[list[PublishTask], int]:
     """分页查询发布任务列表"""
-    query = select(PublishTask).where(PublishTask.is_deleted.is_(False))
+    query = select(PublishTask).where(
+        PublishTask.is_deleted.is_(False),
+        PublishTask.entity_type.in_(["Content", "Schedule"]),
+    )
 
+    # 只查询 Content 表中有有效数据（未删除、未废弃）的发布任务
     query = query.where(
         PublishTask.entity_id.in_(
-            select(Content.id).where(Content.is_discarded.is_(False))
+            select(Content.id).where(
+                Content.is_deleted.is_(False),
+                Content.is_discarded.is_(False),
+            )
         )
     )
 
-    # 按内容名称搜索
     if content_name:
         query = query.where(PublishTask.entity_name.ilike(f"%{content_name}%"))
 
-    # 按内容类型筛选
     if content_types:
         query = query.where(PublishTask.content_type.in_(content_types))
 
-    # 按发布状态筛选
+    if ingest_statuses:
+        query = query.join(Content, Content.id == PublishTask.entity_id).where(
+            Content.status.in_(ingest_statuses),
+            Content.is_deleted.is_(False),
+            Content.is_discarded.is_(False)
+        )
+
     if publish_statuses:
         query = query.where(PublishTask.publish_status.in_(publish_statuses))
 
-    # 按发布时间范围筛选
     if publish_time_from:
         dt = datetime.fromisoformat(publish_time_from)
         query = query.where(PublishTask.publish_time >= dt.replace(tzinfo=app_tz) if dt.tzinfo is None else dt)
@@ -94,13 +137,30 @@ async def list_publish_tasks(
         dt = datetime.fromisoformat(unpublish_time_to)
         query = query.where(PublishTask.unpublish_time <= dt.replace(tzinfo=app_tz) if dt.tzinfo is None else dt)
 
-    # 统计总数
     total = (await db.execute(select(func.count()).select_from(query.subquery()))).scalar_one()
 
-    # 分页查询
+    if sort_by and sort_order:
+        if sort_by == "ingest_status":
+            if ingest_statuses:
+                sort_column = Content.status
+            else:
+                query = query.join(Content, Content.id == PublishTask.entity_id)
+                sort_column = Content.status
+        else:
+            sort_column = getattr(PublishTask, sort_by, None)
+        
+        if sort_column is not None:
+            if sort_order == 'desc':
+                query = query.order_by(sort_column.desc())
+            else:
+                query = query.order_by(sort_column.asc())
+        else:
+            query = query.order_by(PublishTask.created_at.desc())
+    else:
+        query = query.order_by(PublishTask.created_at.desc())
+
     result = await db.execute(
-        query.order_by(PublishTask.created_at.desc())
-        .offset((page - 1) * page_size)
+        query.offset((page - 1) * page_size)
         .limit(page_size)
     )
     return result.scalars().all(), total
@@ -109,19 +169,27 @@ async def list_publish_tasks(
 async def get_entity_current_publish_status(
     db: AsyncSession,
     entity_type: str,
-    entity_id: int
+    entity_id: int,
+    for_update: bool = False,
 ) -> Optional[PublishTask]:
-    """获取实体当前的发布任务（最新未删除，含已取消，复用同一条避免脏数据）"""
-    return (await db.execute(
+    """获取实体当前的发布任务（最新未删除，含已取消，复用同一条避免脏数据）。
+
+    :param for_update: True 时加 SELECT ... FOR UPDATE 行级锁，
+        用于发布/下架等写操作场景，序列化对同一实体的并发请求，避免死锁。
+    """
+    stmt = (
         select(PublishTask)
         .where(
             PublishTask.entity_type == entity_type,
             PublishTask.entity_id == entity_id,
-            PublishTask.is_deleted.is_(False)
+            PublishTask.is_deleted.is_(False),
         )
         .order_by(PublishTask.created_at.desc())
         .limit(1)
-    )).scalar_one_or_none()
+    )
+    if for_update:
+        stmt = stmt.with_for_update()
+    return (await db.execute(stmt)).scalar_one_or_none()
 
 
 async def create_publish_task(db: AsyncSession, task: PublishTask) -> PublishTask:
@@ -139,12 +207,12 @@ async def update_publish_task(db: AsyncSession, task: PublishTask) -> PublishTas
     return task
 
 
-async def cancel_publish_task(db: AsyncSession, task_id: int) -> bool:
-    """取消发布计划：清空定时时间，重置发布状态，任务保持可用"""
+async def cancel_publish_task(db: AsyncSession, task_id: int, revert_publish_status: str = "none") -> bool:
+    """取消发布计划：清空定时时间，回退发布状态，任务保持可用"""
     task = await get_publish_task_by_id(db, task_id)
     if task and task.status == "pending":
         task.scheduled_time = None
-        task.publish_status = "none"
+        task.publish_status = revert_publish_status
         await db.flush()
         return True
     return False
@@ -226,10 +294,23 @@ async def get_publish_task_by_correlate_id(db: AsyncSession, correlate_id: str) 
 
 
 async def get_ingest_history_by_correlate_id(db: AsyncSession, correlate_id: str) -> Optional[IngestHistory]:
-    """根据 SOAP 关联 ID 查询注入历史"""
+    """根据 SOAP 关联 ID 查询注入历史（返回第一条）"""
     return (await db.execute(
-        select(IngestHistory).where(IngestHistory.correlate_id == correlate_id, IngestHistory.is_deleted.is_(False))
+        select(IngestHistory).where(
+            IngestHistory.correlate_id == correlate_id,
+            IngestHistory.is_deleted.is_(False),
+        ).order_by(IngestHistory.id).limit(1)
     )).scalar_one_or_none()
+
+
+async def get_ingest_histories_by_correlate_id(db: AsyncSession, correlate_id: str) -> list[IngestHistory]:
+    """根据 SOAP 关联 ID 查询所有注入历史"""
+    return list((await db.execute(
+        select(IngestHistory).where(
+            IngestHistory.correlate_id == correlate_id,
+            IngestHistory.is_deleted.is_(False),
+        )
+    )).scalars().all())
 
 
 async def create_ingest_history(db: AsyncSession, history: IngestHistory) -> IngestHistory:

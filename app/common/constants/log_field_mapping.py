@@ -26,10 +26,16 @@ FOREIGN_KEY_FIELDS: dict[str, list[FieldMapping]] = {
     ],
     "dict_node": [FieldMapping("parent_id", EnrichFieldType.FOREIGN_KEY, "parent_name", "dict_node")],
     "menu": [FieldMapping("parent_id", EnrichFieldType.FOREIGN_KEY, "parent_name", "menu")],
+    "user": [
+        FieldMapping("role_ids", EnrichFieldType.FOREIGN_KEY_ARRAY, "role_names", "role"),
+    ],
     "provider": [
         FieldMapping("l1_assignee_id", EnrichFieldType.FOREIGN_KEY, "l1_assignee_name", "user"),
         FieldMapping("l2_assignee_id", EnrichFieldType.FOREIGN_KEY, "l2_assignee_name", "user"),
         FieldMapping("l3_assignee_id", EnrichFieldType.FOREIGN_KEY, "l3_assignee_name", "user"),
+    ],
+    "task": [
+        FieldMapping("assignee_id", EnrichFieldType.FOREIGN_KEY, "assignee_name", "user"),
     ],
     "contract": [
         FieldMapping("provider_id", EnrichFieldType.FOREIGN_KEY, "provider_name", "provider"),
@@ -44,24 +50,38 @@ FOREIGN_KEY_FIELDS: dict[str, list[FieldMapping]] = {
         FieldMapping("content_id", EnrichFieldType.FOREIGN_KEY, "content_name", "content"),
         FieldMapping("type_id", EnrichFieldType.FOREIGN_KEY, "type_name", "content_type"),
         FieldMapping("package_ids", EnrichFieldType.FOREIGN_KEY_ARRAY, "package_names", "package"),
+        FieldMapping("tag_ids", EnrichFieldType.FOREIGN_KEY_ARRAY, "tag_names", "tag"),
     ],
     "cast_role_map": [
         FieldMapping("cast_id", EnrichFieldType.FOREIGN_KEY, "cast_name", "cast"),
     ],
     "content": [
-        FieldMapping("genre_id", EnrichFieldType.FOREIGN_KEY, "genre_name", "genre"),
+        # 题材/标签存于中间表，名称由 API 层合并进快照（genre_names/custom_tag_names），
+        # 此处不再保留已废弃的 genre_id 单值映射（genre_id 列已从主表/元数据表移除）
         FieldMapping("custom_tag_ids", EnrichFieldType.FOREIGN_KEY_ARRAY, "custom_tag_names", "custom_tag"),
+        # 节目单编辑日志补频道名（channel_id 由 API 层合并自 parent_id，对齐创建日志 schedule 口径）
+        FieldMapping("channel_id", EnrichFieldType.FOREIGN_KEY, "channel_name", "channel"),
+    ],
+    "schedule": [
+        # 节目单快照补充所属频道名称（前端 schedule 标签段已有 channel_name 文案）
+        FieldMapping("channel_id", EnrichFieldType.FOREIGN_KEY, "channel_name", "channel"),
     ],
     "program_metadata": [
         FieldMapping("content_id", EnrichFieldType.FOREIGN_KEY, "content_name", "content"),
         FieldMapping("type_id", EnrichFieldType.FOREIGN_KEY, "type_name", "content_type"),
+        FieldMapping("tag_ids", EnrichFieldType.FOREIGN_KEY_ARRAY, "tag_names", "tag"),
     ],
     "series_metadata": [
         FieldMapping("content_id", EnrichFieldType.FOREIGN_KEY, "content_name", "content"),
         FieldMapping("type_id", EnrichFieldType.FOREIGN_KEY, "type_name", "content_type"),
+        FieldMapping("tag_ids", EnrichFieldType.FOREIGN_KEY_ARRAY, "tag_names", "tag"),
     ],
     "movie": [
         FieldMapping("content_id", EnrichFieldType.FOREIGN_KEY, "content_name", "content"),
+    ],
+    "content_auth": [
+        FieldMapping("role_ids", EnrichFieldType.FOREIGN_KEY_ARRAY, "role_names", "role"),
+        FieldMapping("user_ids", EnrichFieldType.FOREIGN_KEY_ARRAY, "user_names", "user"),
     ],
 }
 
@@ -76,9 +96,10 @@ DICT_CODE_FIELDS: dict[str, list[FieldMapping]] = {
     ],
     "license": [
         FieldMapping("service_type", EnrichFieldType.DICT_CODE, "service_type_name", "ServiceType"),
+        FieldMapping("regions", EnrichFieldType.DICT_CODE_ARRAY, "regions_name", "Regions"),
     ],
     "physical_channel": [
-        FieldMapping("mediaservice", EnrichFieldType.DICT_CODE, "mediaservice_name", "mediaservice"),
+        FieldMapping("mediaservice", EnrichFieldType.DICT_CODE, "mediaservice_name", "Mediaservice"),
         FieldMapping("definition", EnrichFieldType.DICT_CODE, "definition_name", "Definition"),
         FieldMapping("videoencode", EnrichFieldType.DICT_CODE, "videoencode_name", "Videoencode"),
     ],
@@ -114,12 +135,13 @@ DICT_CODE_FIELDS: dict[str, list[FieldMapping]] = {
         FieldMapping("subtitle_lang", EnrichFieldType.DICT_CODE_ARRAY, "subtitle_lang_names", "Language"),
         FieldMapping("rating_level", EnrichFieldType.DICT_CODE, "rating_level_name", "RatingLevel"),
         FieldMapping("advice", EnrichFieldType.DICT_CODE_ARRAY, "advice_names", "Advice"),
+        FieldMapping("metalayout", EnrichFieldType.DICT_CODE, "metalayout_name", "Metalayout"),
     ],
     "movie": [
         FieldMapping("audio_type", EnrichFieldType.DICT_CODE, "audio_type_name", "AudioType"),
         FieldMapping("screen_format", EnrichFieldType.DICT_CODE, "screen_format_name", "ScreenFormat"),
         FieldMapping("definition", EnrichFieldType.DICT_CODE, "definition_name", "Definition"),
-        FieldMapping("mediaservice", EnrichFieldType.DICT_CODE, "mediaservice_name", "mediaservice"),
+        FieldMapping("mediaservice", EnrichFieldType.DICT_CODE, "mediaservice_name", "Mediaservice"),
     ],
 }
 
@@ -136,7 +158,6 @@ STATUS_ENUM_FIELDS: dict[str, list[FieldMapping]] = {
     "crawl_task": [
         FieldMapping("crawl_status", EnrichFieldType.STATUS_ENUM, "crawl_status_label_key", "crawl_task_status"),
     ],
-    "user": [FieldMapping("status", EnrichFieldType.STATUS_ENUM, "status_label_key", "user_status")],
     "role": [FieldMapping("status", EnrichFieldType.STATUS_ENUM, "status_label_key", "role_status")],
     "dict_node": [FieldMapping("status", EnrichFieldType.STATUS_ENUM, "status_label_key", "dict_node_status")],
     "sensitive_word": [FieldMapping("status", EnrichFieldType.STATUS_ENUM, "status_label_key", "sensitive_word_status")],
@@ -211,6 +232,7 @@ ENTITY_TABLE_MAP: dict[str, str] = {
     "physical_channel": "physical_channel",
     "channel_metadata": "channel_metadata",
     "schedule": "content",
+    "channel": "content",
     "schedule_metadata": "schedule_metadata",
     "cast_role_map": "cast_role_map",
     "package": "package",

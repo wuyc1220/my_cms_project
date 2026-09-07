@@ -31,6 +31,8 @@ from app.internal.cms_biz_metada.services.entity_data_service import (
 )
 from app.internal.cms_biz_system.services.operation_log_service import OperationType, write_log
 from app.common.utils.log_enricher import orm_to_dict, prepare_log_values
+from app.common.core.i18n import get_msg
+from app.soap.c2 import CategorySyncBuilder
 from pydantic import BaseModel
 
 router = APIRouter(prefix="/categories")
@@ -92,8 +94,8 @@ async def create_category_api(
         user_id=current_user.id,
         user_name=current_user.username,
         operation_type=OperationType.CATEGORY_CREATE,
-        operation_object=f"栏目 {body.name}",
-        operation_content=f"Created category: name={body.name}, platform={body.platform}, type={body.category_type}",
+        operation_object_code="OBJ_CATEGORY", operation_object_params={"name": body.name},
+        operation_content_code="LOG_CATEGORY_CREATE", operation_content_params={"name": body.name},
         ip_address=_get_ip(request),
         result="success",
         previous_value=prev_val,
@@ -113,20 +115,25 @@ async def batch_delete_categories_api(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    rows = (await db.execute(select(Category.name).where(Category.id.in_(body.ids)))).scalars().all()
-    cat_names = ", ".join(rows) if rows else str(body.ids)
+    categories = (await db.execute(select(Category).where(Category.id.in_(body.ids)))).scalars().all()
+    cat_names = ", ".join([c.name for c in categories]) if categories else str(body.ids)
+    prev_data = [orm_to_dict(c) for c in categories]
+    prev_val, _, raw_val = await prepare_log_values(db, "category", prev_data, None)
     deleted = await batch_delete_categories(db, body)
     await write_log(
         db,
         user_id=current_user.id,
         user_name=current_user.username,
         operation_type=OperationType.CATEGORY_BATCH_DELETE,
-        operation_object=f"栏目 {cat_names}",
-        operation_content=f"批量删除栏目: {cat_names}",
+        operation_object_code="OBJ_CATEGORY", operation_object_params={"name": cat_names},
+        operation_content_code="LOG_CATEGORY_BATCH_DELETE", operation_content_params={"names": cat_names},
         ip_address=_get_ip(request),
         result="success",
         entity_type="category",
         entity_id=body.ids[0] if body.ids else None,
+        previous_value=prev_val,
+        updated_value=None,
+        updated_value_json=raw_val,
     )
     await db.commit()
     return {"success": True, "deleted": deleted}
@@ -150,8 +157,8 @@ async def update_category_api(
         user_id=current_user.id,
         user_name=current_user.username,
         operation_type=OperationType.CATEGORY_EDIT,
-        operation_object=f"栏目 {old.name}",
-        operation_content=f"Updated category: ID={category_id}, name={cat.name}",
+        operation_object_code="OBJ_CATEGORY", operation_object_params={"name": old.name},
+        operation_content_code="LOG_CATEGORY_EDIT", operation_content_params={"name": cat.name},
         ip_address=_get_ip(request),
         result="success",
         previous_value=prev_val,
@@ -181,8 +188,8 @@ async def delete_category_api(
         user_id=current_user.id,
         user_name=current_user.username,
         operation_type=OperationType.CATEGORY_DELETE,
-        operation_object=f"栏目 {cat_name}",
-        operation_content=f"Deleted category: ID={category_id}, name={cat_name}",
+        operation_object_code="OBJ_CATEGORY", operation_object_params={"name": cat_name},
+        operation_content_code="LOG_CATEGORY_DELETE", operation_content_params={"name": cat_name},
         ip_address=_get_ip(request),
         result="success",
         previous_value=prev_val,
@@ -267,10 +274,62 @@ async def reorder_category_contents_api(
 async def remove_category_content_api(
     category_id: int,
     content_id: int,
+    request: Request,
     db: AsyncSession = Depends(get_db),
-    _: User = Depends(get_current_user),
+    current_user: User = Depends(get_current_user),
 ):
+    import json
+    # 先查询栏目信息（用于日志显示），再执行移除
+    category = await get_category(db, category_id)
+    category_name = category.name if category else None
+
     await remove_category_content(db, category_id, content_id)
+
+    # 已发布内容取消关联后回滚状态
+    from app.internal.cms_biz_orchestration.repositories.content_repository import get_content_by_id
+    from app.internal.cms_biz_orchestration.services.workflow_service import (
+        rollback_after_published_edit,
+        complete_process_and_update_status,
+    )
+    content = await get_content_by_id(db, content_id)
+    if content:
+        await rollback_after_published_edit(
+            db, content_id, content.content_type,
+            current_user.username, "取消栏目关联",
+        )
+
+    # 记录 Category 流程节点（与关联栏目对称，状态回滚已由 rollback_after_published_edit 处理）
+    if content and category_name:
+        await complete_process_and_update_status(
+            db,
+            content_id=content_id,
+            content_type=content.content_type,
+            process_name="Category",
+            processed_by=current_user.username,
+            info=f"取消栏目关联: {category_name}",
+            skip_status_update=True,
+        )
+
+    # 写入内容详情页活动日志（与内容详情页入口 live.py#unlink_content_category_api 保持一致）
+    prev_val = json.dumps({"category_name": category_name}, ensure_ascii=False) if category_name else None
+    await write_log(
+        db,
+        user_id=current_user.id,
+        user_name=current_user.username,
+        operation_type=OperationType.CONTENT_CATEGORY_UNLINK,
+        operation_object_code="log.category.unlink",
+        operation_content_code="log.category.unlink",
+        content_id=content_id,
+        entity_type="content",
+        entity_id=content_id,
+        previous_value=prev_val,
+        updated_value=None,
+        # 原始入参快照：被解除关联的栏目 ID
+        updated_value_json=json.dumps({"content_id": content_id, "category_id": category_id}, ensure_ascii=False),
+        ip_address=_get_ip(request),
+        result="success",
+    )
+    await db.commit()
     return {"success": True}
 
 
@@ -283,3 +342,105 @@ async def get_category_history(
 ):
     from app.internal.cms_biz_system.services.operation_log_service import list_entity_history
     return await list_entity_history(db, "category", category_id, limit)
+
+
+# ---------- Sync to Business System ----------
+
+class CategorySyncRequest(BaseModel):
+    """Category 同步请求体"""
+    category_ids: list[int]
+
+class CategorySyncResponse(BaseModel):
+    """Category 同步响应"""
+    success: bool
+    file_path: str
+    stats: dict
+    synced_ids: list[int]
+    message: str
+    correlate_id: str | None = None
+    soap_success: bool | None = None
+
+
+@router.post("/sync", response_model=CategorySyncResponse)
+async def sync_categories_to_business(
+    body: CategorySyncRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    将选中的 Category（栏目）同步给业务系统。
+
+    生成符合 C2 规范的 ADI XML，包含：
+    - Category 对象（REGIST/UPDATE/SKIP 基于变更检测）
+    - 关联的 Picture 对象
+    - Picture → Category 的 Mapping 关系
+
+    同步策略：
+    - 首次同步 → REGIST
+    - 已同步且无变更 → SKIP（不输出 Object，不影响已分发数据）
+    - 已同步且有变更 → UPDATE
+    """
+    category_ids = body.category_ids
+    if not category_ids:
+        return CategorySyncResponse(
+            success=False,
+            file_path="",
+            stats={"regist": 0, "update": 0, "skip": 0},
+            synced_ids=[],
+            message=get_msg("CATEGORY_IDS_REQUIRED"),
+        )
+
+    try:
+        builder = CategorySyncBuilder(db)
+        result = await builder.build_sync(category_ids)
+
+        # 记录操作日志
+        await write_log(
+            db,
+            user_id=current_user.id,
+            user_name=current_user.username,
+            operation_type="CATEGORY_SYNC",
+            operation_object_code="OBJ_CATEGORY",
+            operation_content_code="LOG_CATEGORY_SYNC",
+            operation_content_params={"result": f"ids={category_ids}, stats={result.get('stats', '')}, CorrelateID={result.get('correlate_id', '')}"},
+            ip_address=_get_ip(request),
+            result="success",
+            entity_type="category",
+            entity_id=category_ids[0],
+        )
+        await db.commit()
+
+        stats = result["stats"]
+        soap_success = result.get("soap_success", True)
+        correlate_id = result.get("correlate_id", "")
+
+        if not correlate_id:
+            # 全部 SKIP，未发送 SOAP 通知
+            message = get_msg("CATEGORY_SYNC_NO_CHANGE")
+        elif soap_success:
+            message = get_msg("CATEGORY_SYNC_SUBMITTED", correlate_id=correlate_id)
+        else:
+            message = get_msg("CATEGORY_SYNC_SOAP_FAILED", error=result.get('soap_error', get_msg("CATEGORY_SYNC_UNKNOWN_ERROR")))
+
+        return CategorySyncResponse(
+            success=soap_success,
+            file_path=result["file_path"],
+            stats=stats,
+            synced_ids=result["synced_ids"],
+            message=message,
+            correlate_id=correlate_id,
+            soap_success=soap_success,
+        )
+
+    except Exception as e:
+        logger = __import__("loguru").logger
+        logger.error(f"[CategorySync] 同步失败: {e}")
+        await db.rollback()
+        return CategorySyncResponse(
+            success=False,
+            file_path="",
+            stats={"regist": 0, "update": 0, "skip": 0},
+            synced_ids=[],
+            message=get_msg("CATEGORY_SYNC_FAILED", error=str(e)),
+        )

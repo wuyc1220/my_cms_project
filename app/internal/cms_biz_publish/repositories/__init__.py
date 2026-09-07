@@ -16,6 +16,7 @@ from .publish_repository import (
     get_ingest_history_by_id,
     get_publish_task_by_correlate_id,
     get_ingest_history_by_correlate_id,
+    get_ingest_histories_by_correlate_id,
     create_ingest_history,
 )
 
@@ -34,5 +35,6 @@ __all__ = [
     "get_ingest_history_by_id",
     "get_publish_task_by_correlate_id",
     "get_ingest_history_by_correlate_id",
+    "get_ingest_histories_by_correlate_id",
     "create_ingest_history",
 ]

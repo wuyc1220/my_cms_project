@@ -18,7 +18,6 @@ class IngestHistoryDetail(Base):
     注入历史明细表。
 
     每次发布 Content 时，为涉及的关联对象创建明细记录。
-    SKIP 的对象不创建明细（无变更则不记录）。
     """
 
     __tablename__ = "ingest_history_detail"

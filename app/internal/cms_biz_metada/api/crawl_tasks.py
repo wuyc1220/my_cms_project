@@ -71,15 +71,18 @@ async def crawl_metadata(
 ):
     """触发元数据爬取"""
     result = await trigger_crawl(db, body)
+    import json as _json
+    upd_val = _json.dumps({"object_type": body.object_type, "object_name": body.object_name}, ensure_ascii=False)
     await write_log(
         db,
         user_id=current_user.id,
         user_name=current_user.username,
         operation_type=OperationType.CRAWL_TASK_CREATE,
         operation_object=f"{body.object_type} {body.object_name}",
-        operation_content=f"Triggered crawl: {body.object_name} ({body.object_type})",
+        operation_content_code="LOG_CRAWL_TASK_CREATE", operation_content_params={"name": body.object_name},
         ip_address=_get_ip(request),
         result="success",
+        updated_value=upd_val,
         entity_type="crawl_task",
         entity_id=result.progress_items[0].task_id if result.progress_items else None,
     )
@@ -105,8 +108,8 @@ async def retry_crawl_task(
         user_id=current_user.id,
         user_name=current_user.username,
         operation_type=OperationType.CRAWL_TASK_RETRY,
-        operation_object=f"爬取任务 ID={task_id}",
-        operation_content=f"Retried crawl task: ID={task_id}",
+        operation_object_code="OBJ_CRAWL_TASK", operation_object_params={"name": task.object_name},
+        operation_content_code="LOG_CRAWL_TASK_RETRY", operation_content_params={"id": task_id},
         ip_address=_get_ip(request),
         result="success",
         previous_value=prev_val,
@@ -127,20 +130,25 @@ async def batch_delete_crawl_tasks(
     current_user: User = Depends(get_current_user),
 ):
     """批量删除爬取任务"""
-    rows = (await db.execute(select(MetadataCrawlTask.object_name).where(MetadataCrawlTask.id.in_(body.ids)))).scalars().all()
-    task_names = ", ".join(rows) if rows else str(body.ids)
+    tasks = (await db.execute(select(MetadataCrawlTask).where(MetadataCrawlTask.id.in_(body.ids)))).scalars().all()
+    task_names = ", ".join([t.object_name for t in tasks]) if tasks else str(body.ids)
+    prev_data = [orm_to_dict(t) for t in tasks]
+    prev_val, _, raw_val = await prepare_log_values(db, "crawl_task", prev_data, None)
     count = await batch_delete_tasks(db, body.ids)
     await write_log(
         db,
         user_id=current_user.id,
         user_name=current_user.username,
         operation_type=OperationType.CRAWL_TASK_BATCH_DELETE,
-        operation_object=f"爬取任务 {task_names}",
-        operation_content=f"批量删除爬取任务: {task_names}",
+        operation_object_code="OBJ_CRAWL_TASK", operation_object_params={"name": task_names},
+        operation_content_code="LOG_CRAWL_TASK_BATCH_DELETE", operation_content_params={"names": task_names},
         ip_address=_get_ip(request),
         result="success",
         entity_type="crawl_task",
         entity_id=body.ids[0] if body.ids else None,
+        previous_value=prev_val,
+        updated_value=None,
+        updated_value_json=raw_val,
     )
     await db.commit()
     return {"success": True, "count": count}
@@ -163,8 +171,8 @@ async def delete_crawl_task(
         user_id=current_user.id,
         user_name=current_user.username,
         operation_type=OperationType.CRAWL_TASK_DELETE,
-        operation_object=f"爬取任务 {task.object_name}",
-        operation_content=f"Deleted crawl task: ID={task_id}",
+        operation_object_code="OBJ_CRAWL_TASK", operation_object_params={"name": task.object_name},
+        operation_content_code="LOG_CRAWL_TASK_DELETE", operation_content_params={"name": task.object_name},
         ip_address=_get_ip(request),
         result="success",
         previous_value=prev_val,
@@ -197,8 +205,8 @@ async def confirm_crawl_selection(
         user_id=current_user.id,
         user_name=current_user.username,
         operation_type=OperationType.CRAWL_TASK_CONFIRM,
-        operation_object=f"爬取任务 ID={task_id}",
-        operation_content=f"Confirmed {len(results)} field(s) from task ID={task_id}",
+        operation_object_code="OBJ_CRAWL_TASK", operation_object_params={"name": new_task.object_name},
+        operation_content_code="LOG_CRAWL_TASK_CONFIRM", operation_content_params={"id": task_id},
         ip_address=_get_ip(request),
         result="success",
         previous_value=prev_val,

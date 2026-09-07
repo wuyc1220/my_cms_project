@@ -41,7 +41,7 @@ class PublishedStatsResponse(BaseModel):
 
 
 class ContentStatusCountResponse(BaseModel):
-    """内容状态统计响应"""
+    """内容状态统计响应（Ingest_Status 字典状态 + Near-Expired/Deleted 计算状态）"""
     waiting_for_materials: int
     in_progress: int
     ready_for_publish: int
@@ -49,12 +49,12 @@ class ContentStatusCountResponse(BaseModel):
     published: int
     publish_failed: int
     no_active_license: int
-    expired: int
-    near_expiry: int = 0
-    near_expiry_days: int = 7
-    deleted: int = 0
     closed: int
     none_status: int
+    # 计算状态（仅 Content Status Count 模块展示）
+    near_expired: int = 0
+    near_expiry_days: int = 7
+    deleted: int = 0
 
 
 class GenreStatusMatrixResponse(BaseModel):
@@ -163,3 +163,5 @@ class DashboardDataResponse(BaseModel):
     task_completion_stats: TaskCompletionStatsResponse
     task_status_count: TaskStatusCountResponse
     task_assigned_matrix: TaskAssignedMatrixResponse
+    # 当前用户是否可见任务相关模块（后端实时查询权限，作为前端显隐权威来源）
+    can_see_task_modules: bool = False

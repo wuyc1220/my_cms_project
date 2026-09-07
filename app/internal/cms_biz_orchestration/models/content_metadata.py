@@ -42,7 +42,7 @@ class ContentMetadata(Base):
 
     # ── 原型 Main 标签页字段 ─────────────────────────────────
     name: Mapped[str] = mapped_column(String(500), nullable=False, comment="主语言名称，初始值默认同 Content Name")
-    # 注意：genre_id 已移除，统一使用 content.genre_id 作为单一数据源
+    # 注意：genre_id 已移除，统一使用 content_genre 中间表作为数据源
     # 注意：custom_tag_ids 已移除，统一使用 content_custom_tag 中间表作为单一数据源
     vod_type: Mapped[list[str] | None] = mapped_column(ARRAY(String(50)), nullable=True, comment="Vod类型数组，来源数据字典 VodType")
     sort_name: Mapped[str | None] = mapped_column(String(500), nullable=True, comment="排序名")
@@ -61,6 +61,8 @@ class ContentMetadata(Base):
     rating_level: Mapped[str | None] = mapped_column(String(20), nullable=True, comment="分级，来源数据字典 RatingLevel")
     advice: Mapped[list[str] | None] = mapped_column(ARRAY(String(100)), nullable=True, comment="分级建议数组，来源数据字典 Advice")
     rating: Mapped[str | None] = mapped_column(String(50), nullable=True, comment="评分")
+    rating_type: Mapped[str | None] = mapped_column(String(50), nullable=True, comment="评分来源类型，如 IMDB、TMDB、DOUBAN 等")
+    rating_id: Mapped[str | None] = mapped_column(String(100), nullable=True, comment="评分来源的唯一标识，如 IMDB ID: tt1234567")
     audio_lang: Mapped[list[str] | None] = mapped_column(ARRAY(String(50)), nullable=True, comment="音频语言数组，来源数据字典 Language")
     subtitle_lang: Mapped[list[str] | None] = mapped_column(ARRAY(String(50)), nullable=True, comment="字幕语言数组，来源数据字典 Language")
     studio: Mapped[str | None] = mapped_column(String(500), nullable=True, comment="制片公司")
@@ -131,7 +133,7 @@ class SeriesMetadata(Base):
 
     # ── 原型 Main 标签页字段 ─────────────────────────────────
     name: Mapped[str] = mapped_column(String(500), nullable=False, comment="主语言名称，初始值默认同 Content Name")
-    # 注意：genre_id 已移除，统一使用 content.genre_id 作为单一数据源
+    # 注意：genre_id 已移除，统一使用 content_genre 中间表作为数据源
     # 注意：custom_tag_ids 已移除，统一使用 content_custom_tag 中间表作为单一数据源
     vod_type: Mapped[list[str] | None] = mapped_column(ARRAY(String(50)), nullable=True, comment="Vod类型数组，来源数据字典 VodType")
     sort_name: Mapped[str | None] = mapped_column(String(500), nullable=True, comment="排序名")
@@ -150,6 +152,8 @@ class SeriesMetadata(Base):
     rating_level: Mapped[str | None] = mapped_column(String(20), nullable=True, comment="分级，来源数据字典 RatingLevel")
     advice: Mapped[list[str] | None] = mapped_column(ARRAY(String(100)), nullable=True, comment="分级建议数组，来源数据字典 Advice")
     rating: Mapped[str | None] = mapped_column(String(50), nullable=True, comment="评分")
+    rating_type: Mapped[str | None] = mapped_column(String(50), nullable=True, comment="评分来源类型，如 IMDB、TMDB、DOUBAN 等")
+    rating_id: Mapped[str | None] = mapped_column(String(100), nullable=True, comment="评分来源的唯一标识，如 IMDB ID: tt1234567")
     audio_lang: Mapped[list[str] | None] = mapped_column(ARRAY(String(50)), nullable=True, comment="音频语言数组，来源数据字典 Language")
     subtitle_lang: Mapped[list[str] | None] = mapped_column(ARRAY(String(50)), nullable=True, comment="字幕语言数组，来源数据字典 Language")
     studio: Mapped[str | None] = mapped_column(String(500), nullable=True, comment="制片公司")
@@ -160,6 +164,10 @@ class SeriesMetadata(Base):
         Boolean, nullable=False, default=True, server_default="true", comment="状态开关: true=YES, false=NO",
     )
     keywords: Mapped[list[str] | None] = mapped_column(ARRAY(Text), nullable=True, comment="关键词数组 [exclusive, hdr]")
+    metalayout: Mapped[str] = mapped_column(
+        String(50), nullable=False, default="0", server_default="0",
+        comment="Metalayout，来源数据字典 Metalayout，默认 0",
+    )
 
     # ── 章节信息 (JSONB) ───────────────────────────────────
     sections_info: Mapped[dict | None] = mapped_column(
@@ -221,7 +229,7 @@ class ChannelMetadata(Base):
 
     # ── 原型 Main 标签页字段 ─────────────────────────────────
     name: Mapped[str] = mapped_column(String(500), nullable=False, comment="频道名称，主语言名称")
-    # 注意：genre_id 已移除，统一使用 content.genre_id 作为单一数据源
+    # 注意：genre_id 已移除，统一使用 content_genre 中间表作为数据源
     # 注意：custom_tag_ids 已移除，统一使用 content_custom_tag 中间表作为单一数据源
     channel_number: Mapped[int | None] = mapped_column(Integer, nullable=True, comment="频道号码")
     description: Mapped[str | None] = mapped_column(Text, nullable=True, comment="简介")
@@ -293,7 +301,7 @@ class ScheduleMetadata(Base):
 
     # ── 原型 Main 标签页字段 ─────────────────────────────────
     name: Mapped[str] = mapped_column(String(500), nullable=False, comment="节目名称，主语言名称")
-    # 注意：genre_id 已移除，统一使用 content.genre_id 作为单一数据源
+    # 注意：genre_id 已移除，统一使用 content_genre 中间表作为数据源
     # 注意：custom_tag_ids 已移除，统一使用 content_custom_tag 中间表作为单一数据源
     # 注意：begin_time / end_time 已移除，统一使用 content 主表作为单一数据源
     vod_type: Mapped[list[str] | None] = mapped_column(ARRAY(String(50)), nullable=True, comment="Vod类型数组")
@@ -308,7 +316,7 @@ class ScheduleMetadata(Base):
     rating_level: Mapped[str | None] = mapped_column(String(20), nullable=True, comment="分级")
     advice: Mapped[list[str] | None] = mapped_column(ARRAY(String(100)), nullable=True, comment="分级建议数组")
     studio: Mapped[str | None] = mapped_column(String(500), nullable=True, comment="制片公司")
-    cdr_id: Mapped[str | None] = mapped_column(String(100), nullable=True, comment="CDR ID")
+    cdr_id: Mapped[str] = mapped_column(String(100), nullable=False, comment="CDR ID")
     tag_ids: Mapped[list[int] | None] = mapped_column(ARRAY(Integer), nullable=True, comment="标签 ID 数组")
     status_flag: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=True, server_default="true", comment="状态开关",

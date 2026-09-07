@@ -64,6 +64,22 @@ async def get_config_int(db: AsyncSession, config_key: str, default_value: int =
         return default_value
 
 
+async def get_config_bool(db: AsyncSession, config_key: str, default_value: bool = False) -> bool:
+    """
+    获取布尔类型配置值
+
+    Args:
+        db: 数据库会话
+        config_key: 配置键
+        default_value: 默认值
+
+    Returns:
+        bool: 配置值
+    """
+    value = await get_config_value(db, config_key, str(default_value).lower())
+    return value.lower() in ("true", "1", "yes")
+
+
 async def list_configs(
     db: AsyncSession,
     page: int = 1,
@@ -129,7 +145,7 @@ async def create_config(db: AsyncSession, data: ConfigCreate) -> Config:
         select(Config.id).where(Config.config_key == data.config_key, Config.is_deleted.is_(False)).limit(1)
     )).scalar_one_or_none()
     if existing:
-        raise BusinessException(ErrorCode.CONFIG_CODE_EXISTS, get_msg("CONFIG_CODE_EXISTS"))
+        raise BusinessException(ErrorCode.CONFIG_CODE_EXISTS, get_msg("CONFIG_CODE_EXISTS", code=data.config_key))
     config = Config(
         config_key=data.config_key,
         config_name=data.config_name,

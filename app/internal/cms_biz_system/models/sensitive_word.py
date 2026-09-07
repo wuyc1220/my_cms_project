@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, UniqueConstraint, func
+from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Integer, String, func, text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.database import Base
@@ -9,7 +9,13 @@ from app.database import Base
 class SensitiveWord(Base):
     __tablename__ = "sensitive_word"
     __table_args__ = (
-        UniqueConstraint("keyword", "type_code", name="uq_sensitive_word_keyword_type"),
+        # 部分唯一索引：敏感词以"关键词"为唯一身份，仅约束未删除数据（配合逻辑删除语义）
+        Index(
+            "uq_sensitive_word_keyword",
+            "keyword",
+            unique=True,
+            postgresql_where=text("is_deleted = false"),
+        ),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)

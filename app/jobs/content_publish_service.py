@@ -71,6 +71,8 @@ async def run_content_publish(db: AsyncSession) -> dict | None:
             ),
         )
         .order_by(PublishTask.scheduled_time.asc())
+        # 行级加锁并跳过已被其他事务锁定的行，避免定时任务与 API 请求并发死锁
+        .with_for_update(skip_locked=True)
     )
     rows = (await db.execute(query)).scalars().all()
     logger.info(f"[ContentPublish] 扫描完成，共找到 {len(rows)} 条待处理发布任务")
@@ -100,6 +102,9 @@ async def run_content_publish(db: AsyncSession) -> dict | None:
             elif refreshed.status == "success":
                 succeeded += 1
                 logger.info(f"[ContentPublish] [{idx}/{len(rows)}] 任务 ID={task_id} 执行成功")
+                # 计划到时执行成功补写操作日志（定时任务不经过 API 层，原先漏记）
+                await publish_service.write_plan_execute_log(db, refreshed)
+                await db.commit()
             elif refreshed.status == "failure":
                 failed += 1
                 logger.error(f"[ContentPublish] [{idx}/{len(rows)}] 任务 ID={task_id} 执行失败，错误信息={refreshed.error_message}")

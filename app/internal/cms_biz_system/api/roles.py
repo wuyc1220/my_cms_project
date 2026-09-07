@@ -1,3 +1,5 @@
+import json
+
 from fastapi import APIRouter, Depends, Request
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -9,7 +11,7 @@ from app.internal.cms_biz_system.models.user import Role
 from app.internal.cms_biz_system.schemas.user_crud import BatchIdsRequest, BatchStatusRequest, RoleCreate, RoleListItem, RoleUpdate
 from app.common.schemas import PaginatedResponse
 from app.internal.cms_biz_system.services.operation_log_service import OperationType, write_log
-from app.common.utils.log_enricher import prepare_log_values, orm_to_dict
+from app.common.utils.log_enricher import prepare_log_values, orm_to_dict, _json_default
 from app.internal.cms_biz_system.services.role_service import (
     batch_delete_roles,
     batch_update_role_status,
@@ -64,8 +66,8 @@ async def create_role_api(
         user_id=current_user.id,
         user_name=current_user.username,
         operation_type=OperationType.ROLE_CREATE,
-        operation_object=f"角色 {role.name}",
-        operation_content=f"Created role: name={role.name}, code={role.code}",
+        operation_object_code="OBJ_ROLE", operation_object_params={"name": role.name},
+        operation_content_code="LOG_ROLE_CREATE", operation_content_params={"name": role.name},
         ip_address=_get_ip(request),
         result="success",
         previous_value=prev_val,
@@ -106,8 +108,8 @@ async def update_role_api(
         user_id=current_user.id,
         user_name=current_user.username,
         operation_type=OperationType.ROLE_EDIT,
-        operation_object=f"角色 {role.name}",
-        operation_content=f"Updated role: ID={role_id}, name={role.name}",
+        operation_object_code="OBJ_ROLE", operation_object_params={"name": role.name},
+        operation_content_code="LOG_ROLE_EDIT", operation_content_params={"name": role.name},
         ip_address=_get_ip(request),
         result="success",
         previous_value=prev_val,
@@ -139,8 +141,8 @@ async def delete_role_api(
         user_id=current_user.id,
         user_name=current_user.username,
         operation_type=OperationType.ROLE_DELETE,
-        operation_object=f"角色 {role_name}",
-        operation_content=f"Deleted role: ID={role_id}, name={role_name}",
+        operation_object_code="OBJ_ROLE", operation_object_params={"name": role_name},
+        operation_content_code="LOG_ROLE_DELETE", operation_content_params={"name": role_name},
         ip_address=_get_ip(request),
         result="success",
         previous_value=prev_val,
@@ -165,15 +167,15 @@ async def update_role_status(
     old_data = orm_to_dict(old_role)
     role = await toggle_role_status(db, role_id, body["status"])
     new_data = orm_to_dict(role)
-    new_status_label = "enabled" if body["status"] == "active" else "disabled"
     prev_val, new_val, raw_val = await prepare_log_values(db, "role", old_data, new_data)
     await write_log(
         db,
         user_id=current_user.id,
         user_name=current_user.username,
         operation_type=OperationType.ROLE_STATUS,
-        operation_object=f"角色 {role.name}",
-        operation_content=f"Changed role status: name={role.name}, new status={new_status_label}",
+        operation_object_code="OBJ_ROLE", operation_object_params={"name": role.name},
+        operation_content_code="LOG_ROLE_STATUS_ENABLED" if body["status"] == "active" else "LOG_ROLE_STATUS_DISABLED",
+        operation_content_params={"name": role.name},
         ip_address=_get_ip(request),
         result="success",
         previous_value=prev_val,
@@ -193,20 +195,47 @@ async def batch_role_status(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    updated = await batch_update_role_status(db, body.ids, body.status)
-    rows = (await db.execute(select(Role.name).where(Role.id.in_(body.ids)))).scalars().all()
-    role_names = ", ".join(rows) if rows else str(body.ids)
-    await write_log(
-        db,
-        user_id=current_user.id,
-        user_name=current_user.username,
-        operation_type=OperationType.ROLE_BATCH_DELETE if body.status == "deleted" else OperationType.ROLE_BATCH_STATUS,
-        operation_object=f"角色 {role_names}",
-        operation_content=f"批量{'删除' if body.status == 'deleted' else ('启用' if body.status == 'active' else '禁用')}角色: {role_names}",
-        ip_address=_get_ip(request),
-        result="success",
-        entity_type="role",
-    )
+    roles = (await db.execute(select(Role).where(Role.id.in_(body.ids)))).scalars().all()
+    is_batch_delete = body.status == "deleted"
+    # 快照必须在 batch_update_role_status 之前物化（该函数复用同一 session 的 ORM 对象，
+    # 更新并 commit 后再读 r.status 拿到的已是目标状态）
+    # 修复详情页操作历史缺失：此前批量只写一条日志且 entity_id=body.ids[0]，
+    # 导致除首个角色外其他角色详情页查不到该操作；现改为每个角色单独一条、绑定各自 entity_id
+    snapshots = [(r.id, r.name, r.status, orm_to_dict(r)) for r in roles]
+    updated = await batch_update_role_status(db, [s[0] for s in snapshots], body.status)
+    for rid, rname, prev_status, prev_dict in snapshots:
+        if is_batch_delete:
+            prev_json = json.dumps(prev_dict, ensure_ascii=False, default=_json_default)
+            status_prev_json = prev_json
+            status_updated_json = None
+        else:
+            # 启用/禁用记录各自的状态摘要，供详情页历史 Previous/Updated Value 展示真实前后状态
+            status_prev_json = json.dumps({"status": prev_status}, ensure_ascii=False)
+            status_updated_json = json.dumps({"status": body.status}, ensure_ascii=False)
+        await write_log(
+            db,
+            user_id=current_user.id,
+            user_name=current_user.username,
+            operation_type=OperationType.ROLE_BATCH_DELETE if is_batch_delete else OperationType.ROLE_BATCH_STATUS,
+            operation_object_code="OBJ_ROLE", operation_object_params={"name": rname},
+            operation_content_code=(
+                "LOG_ROLE_BATCH_DELETE" if is_batch_delete
+                else "LOG_ROLE_BATCH_ENABLE" if body.status == "active"
+                else "LOG_ROLE_BATCH_DISABLE"
+            ),
+            operation_content_params={"names": rname},
+            ip_address=_get_ip(request),
+            result="success",
+            entity_type="role",
+            entity_id=rid,
+            previous_value=status_prev_json,
+            updated_value=status_updated_json,
+            updated_value_json=(
+                json.dumps({**prev_dict, "status": body.status}, ensure_ascii=False, default=_json_default)
+                if not is_batch_delete
+                else prev_json
+            ),
+        )
     await db.commit()
     return {"success": True, "updated": updated}
 
@@ -218,19 +247,27 @@ async def batch_delete_role_api(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    roles = (await db.execute(select(Role).where(Role.id.in_(body.ids)))).scalars().all()
+    # 快照在 batch_delete_roles（内部会更新 ORM 对象并 commit）之前物化；
+    # 每个角色单独写一条日志并绑定各自 entity_id，确保各角色详情页历史均可查询
+    snapshots = [(r.id, r.name, orm_to_dict(r)) for r in roles]
     deleted = await batch_delete_roles(db, body.ids)
-    rows = (await db.execute(select(Role.name).where(Role.id.in_(body.ids)))).scalars().all()
-    role_names = ", ".join(rows) if rows else str(body.ids)
-    await write_log(
-        db,
-        user_id=current_user.id,
-        user_name=current_user.username,
-        operation_type=OperationType.ROLE_BATCH_DELETE,
-        operation_object=f"角色 {role_names}",
-        operation_content=f"批量删除角色: {role_names}",
-        ip_address=_get_ip(request),
-        result="success",
-        entity_type="role",
-    )
+    for rid, rname, prev_dict in snapshots:
+        prev_json = json.dumps(prev_dict, ensure_ascii=False, default=_json_default)
+        await write_log(
+            db,
+            user_id=current_user.id,
+            user_name=current_user.username,
+            operation_type=OperationType.ROLE_BATCH_DELETE,
+            operation_object_code="OBJ_ROLE", operation_object_params={"name": rname},
+            operation_content_code="LOG_ROLE_BATCH_DELETE", operation_content_params={"names": rname},
+            ip_address=_get_ip(request),
+            result="success",
+            entity_type="role",
+            entity_id=rid,
+            previous_value=prev_json,
+            updated_value=None,
+            updated_value_json=prev_json,
+        )
     await db.commit()
     return {"success": True, "deleted": deleted}

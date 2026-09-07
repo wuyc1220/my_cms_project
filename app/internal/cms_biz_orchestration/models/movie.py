@@ -52,6 +52,7 @@ class Movie(Base):
     # ── 文件信息 ───────────────────────────────────────────
     file_name: Mapped[str] = mapped_column(String(500), nullable=False, comment="文件名")
     file_path: Mapped[str] = mapped_column(String(1000), nullable=False, comment="文件存储路径（本地/SFTP/MinIO）")
+    relative_path: Mapped[str | None] = mapped_column(String(1000), nullable=True, comment="文件相对路径，用于下载")
     file_size: Mapped[int] = mapped_column(
         Integer, nullable=False, default=0, server_default="0", comment="文件大小（字节）"
     )
@@ -69,11 +70,11 @@ class Movie(Base):
     closed_captioning: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default="false", comment="隐藏字幕"
     )
-    duration: Mapped[int] = mapped_column(
-        Integer, nullable=False, comment="时长（分钟），非字幕类型必填"
+    duration: Mapped[int | None] = mapped_column(
+        Integer, nullable=True, comment="时长（分钟），非字幕类型必填，字幕类型可为空"
     )
-    definition: Mapped[str] = mapped_column(
-        String(20), nullable=False, comment="清晰度: SD/HD，非字幕类型必填"
+    definition: Mapped[str | None] = mapped_column(
+        String(20), nullable=True, comment="清晰度: SD/HD，非字幕类型必填，字幕类型可为空"
     )
     encryption: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default="false", comment="加密"

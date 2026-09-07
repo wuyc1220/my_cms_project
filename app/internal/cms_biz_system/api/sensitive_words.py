@@ -2,11 +2,13 @@ from datetime import datetime
 
 from fastapi import APIRouter, Depends, Query, Request, UploadFile
 from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.common.dependencies import _get_ip, get_current_user
 from app.common.dependencies import get_db
+from app.common.services.sensitive_check_service import SensitiveCheckService
 from app.internal.cms_biz_system.models.sensitive_word import SensitiveWord
 from app.internal.cms_biz_system.models.user import User
 from app.common.schemas import BatchDeleteRequest
@@ -27,6 +29,7 @@ from app.internal.cms_biz_system.services.sensitive_word_service import (
     create_sensitive_word,
     delete_sensitive_word,
     export_excel,
+    generate_import_template,
     get_sensitive_word,
     import_excel,
     list_sensitive_words,
@@ -35,6 +38,17 @@ from app.internal.cms_biz_system.services.sensitive_word_service import (
 )
 
 router = APIRouter(prefix="/sensitive-words")
+
+
+class SensitiveCheckRequest(BaseModel):
+    """敏感词预校验请求体：任意键值对，递归检查所有字符串值。"""
+    data: dict
+
+
+class SensitiveCheckResponse(BaseModel):
+    """敏感词预校验响应。"""
+    has_sensitive: bool
+    matched_fields: list[str] = []
 
 
 @router.get("/", response_model=PaginatedResponse[SensitiveWordListItem])
@@ -54,6 +68,19 @@ async def get_sensitive_word_list(
     return await list_sensitive_words(
         db, page, page_size, keyword, type_codes, status,
         created_start, created_end, sort_by, sort_order,
+    )
+
+
+@router.get("/import-template")
+async def download_import_template_api(
+    _: User = Depends(get_current_user),
+):
+    """下载导入模板，表头按请求语言（Accept-Language）本地化"""
+    data = generate_import_template()
+    return StreamingResponse(
+        iter([data]),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": "attachment; filename=sensitive_words_import_template.xlsx"},
     )
 
 
@@ -81,8 +108,8 @@ async def create_sensitive_word_api(
         user_id=current_user.id,
         user_name=current_user.username,
         operation_type=OperationType.SENSITIVE_WORD_CREATE,
-        operation_object=f"敏感词 {body.keyword}",
-        operation_content=f"Created sensitive word: keyword={body.keyword}, type={body.type_code}",
+        operation_object_code="OBJ_SENSITIVE_WORD", operation_object_params={"name": body.keyword},
+        operation_content_code="LOG_SENSITIVE_WORD_CREATE", operation_content_params={"keyword": body.keyword},
         ip_address=_get_ip(request),
         result="success",
         previous_value=prev_val,
@@ -114,8 +141,8 @@ async def update_sensitive_word_api(
         user_id=current_user.id,
         user_name=current_user.username,
         operation_type=OperationType.SENSITIVE_WORD_EDIT,
-        operation_object=f"敏感词 {old_keyword}",
-        operation_content=f"Updated sensitive word: ID={word_id}, keyword={word.keyword}",
+        operation_object_code="OBJ_SENSITIVE_WORD", operation_object_params={"name": old_keyword},
+        operation_content_code="LOG_SENSITIVE_WORD_EDIT", operation_content_params={"keyword": word.keyword},
         ip_address=_get_ip(request),
         result="success",
         previous_value=prev_val,
@@ -146,8 +173,9 @@ async def toggle_sensitive_word_status_api(
         user_id=current_user.id,
         user_name=current_user.username,
         operation_type=OperationType.SENSITIVE_WORD_STATUS,
-        operation_object=f"敏感词 {word.keyword}",
-        operation_content=f"Changed status to {body.status}: ID={word_id}",
+        operation_object_code="OBJ_SENSITIVE_WORD", operation_object_params={"name": word.keyword},
+        operation_content_code="LOG_SENSITIVE_WORD_STATUS_ENABLED" if body.status == "active" else "LOG_SENSITIVE_WORD_STATUS_DISABLED",
+        operation_content_params={"keyword": word.keyword},
         ip_address=_get_ip(request),
         result="success",
         previous_value=prev_val,
@@ -175,8 +203,9 @@ async def batch_toggle_sensitive_word_status_api(
         user_id=current_user.id,
         user_name=current_user.username,
         operation_type=OperationType.SENSITIVE_WORD_BATCH_STATUS,
-        operation_object=f"敏感词 {word_names}",
-        operation_content=f"批量{'启用' if body.status == 'active' else '禁用'}敏感词: {word_names}",
+        operation_object_code="OBJ_SENSITIVE_WORD", operation_object_params={"name": word_names},
+        operation_content_code="LOG_SENSITIVE_WORD_BATCH_STATUS_ENABLED" if body.status == "active" else "LOG_SENSITIVE_WORD_BATCH_STATUS_DISABLED",
+        operation_content_params={"names": word_names},
         ip_address=_get_ip(request),
         result="success",
         entity_type="sensitive_word",
@@ -200,8 +229,8 @@ async def batch_delete_sensitive_words_api(
         user_id=current_user.id,
         user_name=current_user.username,
         operation_type=OperationType.SENSITIVE_WORD_BATCH_DELETE,
-        operation_object=f"敏感词 {word_names}",
-        operation_content=f"批量删除敏感词: {word_names}",
+        operation_object_code="OBJ_SENSITIVE_WORD", operation_object_params={"name": word_names},
+        operation_content_code="LOG_SENSITIVE_WORD_BATCH_DELETE", operation_content_params={"names": word_names},
         ip_address=_get_ip(request),
         result="success",
         entity_type="sensitive_word",
@@ -227,8 +256,8 @@ async def delete_sensitive_word_api(
         user_id=current_user.id,
         user_name=current_user.username,
         operation_type=OperationType.SENSITIVE_WORD_DELETE,
-        operation_object=f"敏感词 {keyword}",
-        operation_content=f"Deleted sensitive word: ID={word_id}, keyword={keyword}",
+        operation_object_code="OBJ_SENSITIVE_WORD", operation_object_params={"name": keyword},
+        operation_content_code="LOG_SENSITIVE_WORD_DELETE", operation_content_params={"keyword": keyword},
         ip_address=_get_ip(request),
         result="success",
         previous_value=prev_val,
@@ -256,8 +285,8 @@ async def export_sensitive_words_api(
         user_id=current_user.id,
         user_name=current_user.username,
         operation_type=OperationType.SENSITIVE_WORD_BATCH_EXPORT,
-        operation_object=f"敏感词 {word_names}",
-        operation_content=f"批量导出敏感词: {word_names}",
+        operation_object_code="OBJ_SENSITIVE_WORD", operation_object_params={"name": word_names},
+        operation_content_code="LOG_SENSITIVE_WORD_BATCH_EXPORT", operation_content_params={"names": word_names},
         ip_address=_get_ip(request),
         result="success",
         entity_type="sensitive_word",
@@ -283,11 +312,44 @@ async def import_sensitive_words_api(
         user_id=current_user.id,
         user_name=current_user.username,
         operation_type=OperationType.SENSITIVE_WORD_IMPORT,
-        operation_object="敏感词导入",
-        operation_content=f"Imported sensitive words: total={result.total}, created={result.created}, updated={result.updated}",
+        operation_object_code="OBJ_SENSITIVE_WORD_IMPORT",
+        operation_content_code="LOG_SENSITIVE_WORD_IMPORT",
+        operation_content_params={"total": result.total, "created": result.created, "updated": result.updated},
         ip_address=_get_ip(request),
         result="success",
         entity_type="sensitive_word",
     )
     await db.commit()
     return result
+
+
+@router.post("/check", response_model=SensitiveCheckResponse)
+async def check_sensitive_words_api(
+    body: SensitiveCheckRequest,
+    db: AsyncSession = Depends(get_db),
+    _: User = Depends(get_current_user),
+):
+    """
+    敏感词预校验：前端在提交表单前调用此接口，检查数据中是否包含敏感词。
+    返回命中的字段路径列表，前端据此提示用户修改后再提交。
+    """
+    check_service = SensitiveCheckService.get_instance()
+    matched_fields: list[str] = []
+
+    async def _check_recursive(value, path: str) -> None:
+        if isinstance(value, str) and value.strip():
+            if await check_service.check_text(db, value):
+                matched_fields.append(path)
+        elif isinstance(value, dict):
+            for k, v in value.items():
+                await _check_recursive(v, f"{path}.{k}" if path else k)
+        elif isinstance(value, list):
+            for i, item in enumerate(value):
+                await _check_recursive(item, f"{path}[{i}]")
+
+    await _check_recursive(body.data, "")
+
+    return SensitiveCheckResponse(
+        has_sensitive=len(matched_fields) > 0,
+        matched_fields=matched_fields,
+    )

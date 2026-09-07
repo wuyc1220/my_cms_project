@@ -47,3 +47,8 @@ class TriggerScheduledTasksRequest(BaseModel):
 class TriggerScheduledTasksResponse(BaseModel):
     success: bool = True
     triggered: int
+
+
+class UpdateCronRequest(BaseModel):
+    """更新定时任务的 Cron 表达式。"""
+    cron_expression: str = Field(..., min_length=1, max_length=100, description="Cron 表达式（5 或 6 位）")

@@ -8,7 +8,7 @@ from loguru import logger
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.internal.cms_biz_metada.models.basic import Picture
+from app.internal.cms_biz_metada.models.basic import Picture, PosterSize
 from app.internal.cms_biz_orchestration.models.cast_role_map import CastRoleMap
 from app.internal.cms_biz_orchestration.models.content_metadata import ContentMetadata
 from app.internal.cms_biz_orchestration.models.movie import Movie
@@ -49,71 +49,104 @@ class ContentStatusService:
         return result.scalar_one_or_none() is not None
 
     @staticmethod
-    async def check_metadata(db: AsyncSession, content_id: int) -> bool:
+    async def check_metadata(db: AsyncSession, content_id: int, content_type: str | None = None) -> bool:
         """
         检查元数据是否完成。
-        判断标准：元数据表有记录即算完成。
+        判断标准：内容类型对应的元数据表有记录即算完成。
+        - MOVIE/EPISODE → ContentMetadata
+        - SERIES/SEASON/SEASON_SERIES → SeriesMetadata
+        - CHANNEL → ChannelMetadata
+        - SCHEDULE → ScheduleMetadata
         """
+        from app.internal.cms_biz_orchestration.models.content_metadata import (
+            ChannelMetadata, ScheduleMetadata, SeriesMetadata,
+        )
+
+        if content_type in ("SERIES", "SEASON", "SEASON_SERIES"):
+            model = SeriesMetadata
+        elif content_type == "CHANNEL":
+            model = ChannelMetadata
+        elif content_type == "SCHEDULE":
+            model = ScheduleMetadata
+        else:
+            # MOVIE/EPISODE 及未传类型默认查 VOD 元数据表
+            model = ContentMetadata
         result = await db.execute(
-            select(ContentMetadata).where(
-                ContentMetadata.content_id == content_id,
-                ContentMetadata.is_deleted.is_(False), ContentMetadata.is_discarded.is_(False)
+            select(model).where(
+                model.content_id == content_id,
+                model.is_deleted.is_(False), model.is_discarded.is_(False)
             ).limit(1)
         )
         return result.scalar_one_or_none() is not None
 
     @staticmethod
-    async def check_posters(db: AsyncSession, content_id: int, content_type: str) -> bool:
+    async def get_posters_completion(
+        db: AsyncSession, content_id: int, content_type: str
+    ) -> dict:
         """
-        检查海报是否完成。
+        获取海报节点的完成状态（含 completed / warning / detail）。
+
         判断标准：
         1. 有必传规格时，所有必传规格都有海报即算完成
         2. 无必传规格时，有任意海报即算完成
         """
-        from app.internal.cms_biz_metada.models.basic import PosterSize
-
-        # 获取 entity_type（与前端保持一致）
         entity_type = _get_entity_type(content_type)
         belonging = entity_type.capitalize()
 
-        # 查询适用的必传海报规格
-        result = await db.execute(
-            select(PosterSize).where(
-                PosterSize.mandatory.is_(True)
+        # 查询当前内容类型适用的必传海报规格（只查未删除）
+        poster_sizes = (
+            await db.execute(
+                select(PosterSize).where(
+                    PosterSize.mandatory.is_(True),
+                    PosterSize.is_deleted.is_(False),
+                )
             )
-        )
-        poster_sizes = result.scalars().all()
+        ).scalars().all()
 
-        # 筛选出当前内容类型适用的必传规格
         applicable_mandatory_sizes = [
             ps for ps in poster_sizes
             if any(b.belonging in (belonging, 'ALL') for b in ps.belongings)
         ]
 
+        # 查询已上传的海报规格 ID（排除软删除/废弃）
+        uploaded_size_ids = {
+            row[0]
+            for row in (
+                await db.execute(
+                    select(Picture.poster_size_id).where(
+                        Picture.entity_type == entity_type,
+                        Picture.entity_id == content_id,
+                        Picture.is_deleted.is_(False),
+                        Picture.is_discarded.is_(False),
+                    )
+                )
+            ).all()
+        }
+
         if not applicable_mandatory_sizes:
-            # 没有必传规格，有任意海报即算完成
-            result = await db.execute(
-                select(Picture).where(
-                    Picture.entity_type == entity_type,
-                    Picture.entity_id == content_id,
-                    Picture.is_deleted.is_(False), Picture.is_discarded.is_(False)
-                ).limit(1)
-            )
-            return result.scalar_one_or_none() is not None
+            pic_count = len(uploaded_size_ids)
+            return {
+                "completed": pic_count > 0,
+                "warning": pic_count == 0,
+                "detail": f"{pic_count} poster(s)" if pic_count else "No posters",
+            }
 
-        # 有必传规格，检查所有必传规格是否都有海报
         mandatory_size_ids = {ps.id for ps in applicable_mandatory_sizes}
+        uploaded_mandatory_count = len(uploaded_size_ids & mandatory_size_ids)
+        completed = uploaded_mandatory_count >= len(mandatory_size_ids)
+        return {
+            "completed": completed,
+            "warning": 0 < uploaded_mandatory_count < len(mandatory_size_ids),
+            "detail": f"{uploaded_mandatory_count}/{len(mandatory_size_ids)} mandatory posters",
+        }
 
-        result = await db.execute(
-            select(Picture.poster_size_id).where(
-                Picture.entity_type == entity_type,
-                Picture.entity_id == content_id,
-                Picture.is_deleted.is_(False), Picture.is_discarded.is_(False)
-            )
+    @staticmethod
+    async def check_posters(db: AsyncSession, content_id: int, content_type: str) -> bool:
+        """检查海报是否完成。"""
+        result = await ContentStatusService.get_posters_completion(
+            db, content_id, content_type
         )
-        uploaded_size_ids = {row[0] for row in result.all()}
-
-        return mandatory_size_ids.issubset(uploaded_size_ids)
+        return result["completed"]
 
     @staticmethod
     async def check_cast_role_map(db: AsyncSession, content_id: int) -> bool:
@@ -250,7 +283,7 @@ class ContentStatusService:
         if content_type in ("MOVIE", "EPISODE"):
             return not await ContentStatusService.check_materials(db, content_id)
 
-        if content_type in ("SERIES", "SEASON"):
+        if content_type in ("SERIES", "SEASON", "SEASON_SERIES"):
             return not await ContentStatusService.check_sub_content(db, content_id)
 
         if content_type == "CHANNEL":
@@ -266,7 +299,7 @@ class ContentStatusService:
         """
         return {
             'materials': await ContentStatusService.check_materials(db, content_id),
-            'metadata': await ContentStatusService.check_metadata(db, content_id),
+            'metadata': await ContentStatusService.check_metadata(db, content_id, content_type),
             'posters': await ContentStatusService.check_posters(db, content_id, content_type),
             'cast_role_map': await ContentStatusService.check_cast_role_map(db, content_id),
             'trailer': await ContentStatusService.check_trailer(db, content_id),
@@ -280,11 +313,12 @@ class ContentStatusService:
         """
         根据子内容状态派生父内容状态。
 
-        规则（优先级 InProgress > WaitingForMaterials > None）：
-        - 任一子内容为 InProgress → 父内容 InProgress
-        - 无 InProgress，但有 WaitingForMaterials → 父内容 WaitingForMaterials
-        - 全部为 None → 父内容 None
-        - 无子内容 → 返回 None（不派生）
+        仅同步 InProgress / WaitingForMaterials，父级进入 ReadyForPublish+ 后
+        完全由自己的流程节点驱动。
+
+        - 任一子内容为 InProgress → 父内容 InProgress（把父级从 None/WaitingForMaterials 拉起）
+        - 无 InProgress 子内容但有子内容 → 返回 None（不触发父级更新，父级保持当前状态）
+        - 无子内容 → 返回 WaitingForMaterials（父级缺少素材）
 
         仅适用于 SERIES / SEASON 类型。
         """
@@ -298,16 +332,11 @@ class ContentStatusService:
         child_statuses = [row[0] for row in result.all()]
 
         if not child_statuses:
-            return None
-
-        has_in_progress = any(s == "InProgress" for s in child_statuses)
-        has_waiting = any(s == "WaitingForMaterials" for s in child_statuses)
-
-        if has_in_progress:
-            return "InProgress"
-        if has_waiting:
             return "WaitingForMaterials"
-        return "None"
+
+        if any(s == "InProgress" for s in child_statuses):
+            return "InProgress"
+        return None
 
     @staticmethod
     async def sync_parent_status(
@@ -323,12 +352,13 @@ class ContentStatusService:
 
         递归向上：EPISODE → SERIES → SEASON。
         """
-        if content_type not in ("MOVIE", "EPISODE", "SERIES"):
+        if content_type not in ("MOVIE", "EPISODE", "SERIES", "SEASON_SERIES"):
             return
 
+        # 查询触发同步的子内容：允许 is_discarded=True（删除子内容后仍需向上同步父级状态）
         content = (
             await db.execute(
-                select(Content).where(Content.id == content_id, Content.is_deleted.is_(False), Content.is_discarded.is_(False))
+                select(Content).where(Content.id == content_id, Content.is_deleted.is_(False))
             )
         ).scalar_one_or_none()
         if not content or content.parent_id is None:
@@ -342,7 +372,7 @@ class ContentStatusService:
         if not parent:
             return
 
-        if parent.content_type not in ("SERIES", "SEASON"):
+        if parent.content_type not in ("SERIES", "SEASON_SERIES", "SEASON"):
             return
 
         derived = await ContentStatusService.derive_status_from_children(db, parent.id)
@@ -382,13 +412,14 @@ class ContentStatusService:
 
 def _get_entity_type(content_type: str) -> str:
     """
-    根据内容类型获取 entity_type（与前端保持一致）。
+    根据内容类型获取 entity_type（与前端保持一致，SERIES/SEASON_SERIES/SEASON 统一为 series）。
     """
     mapping = {
         'MOVIE': 'program',
         'EPISODE': 'program',
         'SERIES': 'series',
-        'SEASON': 'season',
+        'SEASON_SERIES': 'series',
+        'SEASON': 'series',
         'CHANNEL': 'channel',
         'SCHEDULE': 'schedule',
     }

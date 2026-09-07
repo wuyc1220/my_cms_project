@@ -17,6 +17,7 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.database import Base
 from app.internal.cms_biz_metada.models.basic import Category  # noqa: F401  # 正向引用，延迟加载
 from app.internal.cms_biz_metada.models.basic import CustomTag  # noqa: F401  # 正向引用，延迟加载
+from app.internal.cms_biz_metada.models.basic import Genre  # noqa: F401  # 正向引用，延迟加载
 
 
 class Package(Base):
@@ -99,8 +100,7 @@ class Content(Base):
         title           内容标题
         status          Ingest 状态（None/WaitingForMaterials/Published 等）
         parent_id       父级内容 id（EPISODE→SERIES；单季SERIES→SEASON；SCHEDULE→CHANNEL）
-        series_type     仅 SERIES/SEASON 有效：1=普通连续剧，2=单季，3=总季
-        genre_id        题材 id（FK → genre.id）
+        series_type    仅 SERIES/SEASON 有效：1=普通连续剧，2=单季，3=总季
         sequence        集序号（仅 EPISODE 有效，在父 SERIES 中的顺序）
         series_ordinal  季号（仅 SERIES 有效，在父 SEASON 中的顺序）
         begin_time      节目单开始时间（仅 SCHEDULE 有效）
@@ -129,10 +129,6 @@ class Content(Base):
     series_type: Mapped[int | None] = mapped_column(
         SmallInteger, nullable=True,
         comment="1=普通连续剧，2=单季连续剧，3=总季连续剧；仅 SERIES/SEASON 有效"
-    )
-    genre_id: Mapped[int | None] = mapped_column(
-        ForeignKey("genre.id", ondelete="SET NULL"), nullable=True, index=True,
-        comment="题材 id，FK → genre.id"
     )
     sequence: Mapped[int | None] = mapped_column(
         SmallInteger, nullable=True,
@@ -195,6 +191,12 @@ class Content(Base):
     )
     custom_tags: Mapped[list["ContentCustomTag"]] = relationship(
         "ContentCustomTag",
+        cascade="all, delete-orphan",
+        lazy="select",
+        back_populates="content",
+    )
+    genres: Mapped[list["ContentGenre"]] = relationship(
+        "ContentGenre",
         cascade="all, delete-orphan",
         lazy="select",
         back_populates="content",
@@ -306,6 +308,39 @@ class ContentCustomTag(Base):
 
     content: Mapped["Content"] = relationship("Content", back_populates="custom_tags", lazy="selectin")
     custom_tag: Mapped["CustomTag"] = relationship("CustomTag", lazy="selectin")
+
+
+class ContentGenre(Base):
+    """
+    内容与题材的多对多中间表。
+
+    字段：
+        id              主键（自增）
+        content_id      外键 → content.id
+        genre_id        外键 → genre.id
+        created_at      关联创建时间
+    """
+
+    __tablename__ = "content_genre"
+    __table_args__ = (
+        UniqueConstraint("content_id", "genre_id", name="uq_content_genre"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    content_id: Mapped[int] = mapped_column(
+        ForeignKey("content.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    genre_id: Mapped[int] = mapped_column(
+        ForeignKey("genre.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    is_deleted: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false", nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
+    created_by: Mapped[int | None] = mapped_column(ForeignKey("cms_user.id", ondelete="SET NULL"), nullable=True)
+    updated_by: Mapped[int | None] = mapped_column(ForeignKey("cms_user.id", ondelete="SET NULL"), nullable=True)
+
+    content: Mapped["Content"] = relationship("Content", back_populates="genres", lazy="selectin")
+    genre: Mapped["Genre"] = relationship("Genre", lazy="selectin")
 
 
 class PhysicalChannel(Base):

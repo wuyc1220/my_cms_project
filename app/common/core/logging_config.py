@@ -22,6 +22,7 @@ from pathlib import Path
 from loguru import logger
 
 from app.common.core.log_enums import LogLevel, ServiceType
+from app.config import app_tz
 
 
 _DEFAULT_SERVICETYPE = "other"
@@ -46,6 +47,12 @@ def _escape_for_loguru(text: str) -> str:
 
 
 def _structured_formatter(record: dict) -> str:
+    # 把 Loguru 默认的 UTC 时间转成项目配置的 APP_TIMEZONE，
+    # 避免容器系统时区为 UTC 时日志时间比本地时间慢 8 小时。
+    try:
+        record["time"] = record["time"].astimezone(app_tz)
+    except Exception:
+        pass
     extra = record["extra"]
     apiname = _escape_for_loguru(extra.get("apiname", ""))
     result = _escape_for_loguru(extra.get("result", ""))
@@ -68,6 +75,11 @@ def _structured_formatter(record: dict) -> str:
 
 
 def _plain_formatter(record: dict) -> str:
+    # 与 _structured_formatter 保持一致：使用项目配置的 APP_TIMEZONE
+    try:
+        record["time"] = record["time"].astimezone(app_tz)
+    except Exception:
+        pass
     msg = _escape_for_loguru(record["message"])
     name = _escape_for_loguru(record["name"])
     func = _escape_for_loguru(record["function"])
@@ -137,11 +149,12 @@ def configure_logging(
     log_path = Path(log_dir)
     log_path.mkdir(parents=True, exist_ok=True)
 
+    # 实时文件名固定，按天滚动时由 Loguru 自动重命名为带时间戳的归档文件
     logger.add(
         str(log_path / "log_error.log"),
         format=fmt_func,
         level="ERROR",
-        rotation=log_rotation,
+        rotation="00:00",
         retention=log_retention,
         encoding="utf-8",
         filter=lambda record: record["extra"].get("_sink", "all") == "all",
@@ -151,7 +164,7 @@ def configure_logging(
         str(log_path / "log_out.log"),
         format=fmt_func,
         level="OUT",
-        rotation=log_rotation,
+        rotation="00:00",
         retention=log_retention,
         encoding="utf-8",
         filter=lambda record: record["level"].name == "OUT" and record["extra"].get("_sink", "all") == "all",
@@ -161,7 +174,7 @@ def configure_logging(
         str(log_path / "log_sql.log"),
         format=fmt_func,
         level="DEBUG",
-        rotation=log_rotation,
+        rotation="00:00",
         retention=log_retention,
         encoding="utf-8",
         filter=lambda record: record["extra"].get("_sink", "all") == "all" and _is_sql_log(record),
@@ -171,7 +184,7 @@ def configure_logging(
         str(log_path / "log_access.log"),
         format=fmt_func,
         level="ACCESS",
-        rotation=log_rotation,
+        rotation="00:00",
         retention=log_retention,
         encoding="utf-8",
         filter=lambda record: record["extra"].get("log_type") == "access" and record["extra"].get("_sink", "all") == "all",

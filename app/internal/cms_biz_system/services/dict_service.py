@@ -1,8 +1,10 @@
+import time
 import uuid
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
+from sqlalchemy.exc import IntegrityError
 
 from ..models.dict import DictNode
 from app.common.core import DictStatus
@@ -10,6 +12,17 @@ from app.internal.cms_biz_system.schemas.user_crud import DictNodeCreate, DictNo
 from loguru import logger
 from app.common.core.i18n import get_msg
 from app.common.core.exceptions import ErrorCode, BusinessException
+
+# 字典树内存缓存（无过滤参数时生效，TTL 5 分钟）
+_dict_tree_cache: dict = {}
+_DICT_TREE_CACHE_TTL = 300
+
+
+async def _fix_sequence(db: AsyncSession, table_name: str, sequence_name: str) -> None:
+    result = await db.execute(text(f"SELECT MAX(id) FROM {table_name}"))
+    max_id = result.scalar() or 0
+    await db.execute(text(f"SELECT setval('{sequence_name}', {max_id + 1}, false)"))
+    logger.warning(f"序列 {sequence_name} 已自动修复为 {max_id + 1}")
 
 
 async def get_node(db: AsyncSession, node_id: int) -> DictNode:
@@ -130,6 +143,15 @@ async def get_tree(
     sort_by: str | None = None,
     sort_order: str | None = None,
 ) -> list[DictNodeListItem]:
+    # 无过滤参数时使用内存缓存（详情页常见场景，字典数据变化极少）
+    use_cache = all(v is None for v in [name, code, remark, sort_by, sort_order])
+
+    if use_cache:
+        now = time.time()
+        if _dict_tree_cache and _dict_tree_cache.get("expires", 0) > now:
+            logger.info("get_tree 命中内存缓存")
+            return [DictNodeListItem.model_validate(item) for item in _dict_tree_cache["data"]]
+
     # 过滤掉已逻辑删除的节点（status='deleted' 或 is_deleted=True），仅返回可见数据
     query = select(DictNode).where(DictNode.status != "deleted", DictNode.is_deleted == False)
     logger.info(f"get_tree 入参: name={name}, code={code}, remark={remark}, sort_by={sort_by}, sort_order={sort_order}")
@@ -147,7 +169,14 @@ async def get_tree(
 
     nodes = (await db.execute(query)).scalars().all()
     tree = _build_tree(nodes)
-    return _filter_tree(tree, name, code, remark)
+    result = _filter_tree(tree, name, code, remark)
+
+    # 无过滤参数时写入内存缓存
+    if use_cache:
+        _dict_tree_cache["data"] = [item.model_dump() for item in result]
+        _dict_tree_cache["expires"] = time.time() + _DICT_TREE_CACHE_TTL
+
+    return result
 
 
 async def get_multi_language_options(db: AsyncSession) -> list[LanguageOption]:
@@ -210,7 +239,16 @@ async def create_node(db: AsyncSession, data: DictNodeCreate) -> DictNode:
         is_system=False,
     )
     db.add(node)
-    await db.commit()
+    try:
+        await db.flush()
+    except IntegrityError as e:
+        if "dict_pkey" in str(e) or "UniqueViolation" in str(e):
+            await db.rollback()
+            await _fix_sequence(db, "dict", "dict_id_seq")
+            db.add(node)
+            await db.flush()
+        else:
+            raise
     await db.refresh(node)
     return _to_response(node)
 

@@ -150,7 +150,7 @@ class WorkflowConfigCreate(BaseModel):
     """创建流程配置请求。"""
     process_code: str = Field(..., max_length=100)
     process_name: str = Field(..., max_length=100)
-    belonging: str  # PROGRAM/SEASON/SERIES/CHANNEL/SCHEDULE
+    belonging: str  # MOVIE/EPISODE/SEASON/SEASON_SERIES/SERIES/CHANNEL/SCHEDULE
 
 
 class WorkflowConfigUpdate(BaseModel):

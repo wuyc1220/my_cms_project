@@ -215,6 +215,43 @@ async def clear_auth(
     logger.info(f"clear_auth: content_ids={content_ids}")
 
 
+async def get_auth_snapshot_map(
+    db: AsyncSession,
+    content_ids: list[int],
+) -> dict[int, dict[str, list[int]]]:
+    """批量查询指定 content_ids 的授权快照，返回 {content_id: {role_ids: [...], user_ids: [...]}}"""
+    snapshot: dict[int, dict[str, list[int]]] = {cid: {"role_ids": [], "user_ids": []} for cid in content_ids}
+    if not content_ids:
+        return snapshot
+    role_auths = (
+        await db.execute(
+            select(ContentAuth.content_id, ContentAuth.role_id)
+            .where(
+                ContentAuth.content_id.in_(content_ids),
+                ContentAuth.role_id.isnot(None),
+                ContentAuth.is_deleted == False,
+            )
+        )
+    ).all()
+    for row in role_auths:
+        if row[1] is not None:
+            snapshot[row[0]]["role_ids"].append(row[1])
+    user_auths = (
+        await db.execute(
+            select(ContentAuth.content_id, ContentAuth.user_id)
+            .where(
+                ContentAuth.content_id.in_(content_ids),
+                ContentAuth.user_id.isnot(None),
+                ContentAuth.is_deleted == False,
+            )
+        )
+    ).all()
+    for row in user_auths:
+        if row[1] is not None:
+            snapshot[row[0]]["user_ids"].append(row[1])
+    return snapshot
+
+
 # ─── 角色下拉选项 ────────────────────────────────────────────────
 
 async def get_roles_for_select(db: AsyncSession) -> list[RoleSimpleItem]:
@@ -233,3 +270,86 @@ async def get_users_for_select(db: AsyncSession) -> list[UserSimpleItem]:
     )
     users = result.scalars().all()
     return [UserSimpleItem(id=u.id, display_name=u.display_name, username=u.username) for u in users]
+
+
+# ─── 检查用户是否有内容的数据权限 ──────────────────────────────
+
+async def check_content_auth_permission(
+    db: AsyncSession,
+    user_id: int,
+    content_id: int,
+) -> bool:
+    """检查指定用户是否有访问指定内容的权限。
+    
+    权限规则（满足任一即可）：
+    1. 用户是该内容的创建者（Content.created_by == user_id）
+    2. content_auth 表中存在授权记录（user_id 或 role_id 匹配）
+    
+    Returns:
+        True: 有权限
+        False: 无权限
+    """
+    from app.internal.cms_biz_system.services.data_auth_filter import is_admin_user
+    from app.internal.cms_biz_system.models.user import User as UserModel
+    
+    # 1. 检查用户是否存在
+    user = await db.get(UserModel, user_id)
+    if not user:
+        return False
+    
+    # 2. ADMIN 角色直接放行
+    if await is_admin_user(db, user):
+        return True
+    
+    # 3. 检查是否是创建者
+    content = await db.get(Content, content_id)
+    if not content:
+        return False
+    
+    if content.created_by == user_id:
+        return True
+    
+    # 4. 检查 content_auth 表中是否有授权
+    # 4.1 用户维度授权
+    user_auth = (
+        await db.execute(
+            select(ContentAuth.id)
+            .where(
+                ContentAuth.content_id == content_id,
+                ContentAuth.user_id == user_id,
+                ContentAuth.is_deleted == False,
+            )
+        )
+    ).scalar_one_or_none()
+    
+    if user_auth:
+        return True
+    
+    # 4.2 角色维度授权
+    from sqlalchemy import or_
+    
+    role_ids_result = await db.execute(
+        select(UserRole.role_id)
+        .where(
+            UserRole.user_id == user_id,
+            UserRole.is_deleted == False,
+        )
+    )
+    role_ids = [row[0] for row in role_ids_result.all() if row[0] is not None]
+    
+    if role_ids:
+        role_auth = (
+            await db.execute(
+                select(ContentAuth.id)
+                .where(
+                    ContentAuth.content_id == content_id,
+                    ContentAuth.role_id.in_(role_ids),
+                    ContentAuth.is_deleted == False,
+                )
+            )
+        ).scalar_one_or_none()
+        
+        if role_auth:
+            return True
+    
+    return False

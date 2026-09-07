@@ -7,9 +7,9 @@
 - 获取指定类型限制值（供其他 service 调用）
 
 业务规则：
-1. content_count / storage_capacity 标记为 is_developed=False，不允许修改
+1. supplier_count / content_count / storage_capacity 均允许修改并保存到表
 2. limit_value=-1 表示不限制
-3. 供应商数量限制校验：查询 provider 表中 is_deleted=false 的记录数
+3. 当前使用量：仅 supplier_count 实时计算；content_count / storage_capacity 待后续业务接入时再实现
 """
 
 from sqlalchemy import func, select
@@ -25,8 +25,8 @@ from app.internal.cms_biz_system.schemas.usage_limit import (
     UsageLimitsUpdateRequest,
 )
 
-# 已开发的功能项：允许修改限制值
-DEVELOPED_LIMIT_TYPES = {"supplier_count"}
+# 允许修改限制值的功能项（均支持保存到表）
+DEVELOPED_LIMIT_TYPES = {"supplier_count", "content_count", "storage_capacity"}
 
 async def get_usage_limits(db: AsyncSession) -> UsageLimitsResponse:
     """
@@ -66,7 +66,7 @@ async def update_usage_limits(
     输入参数：
         data    UsageLimitsUpdateRequest
     业务规则：
-        - 不允许修改 is_developed=False 的功能项
+        - 仅允许修改 DEVELOPED_LIMIT_TYPES 中配置的功能项
     输出：
         更新后的 UsageLimitsResponse
     """
@@ -123,5 +123,6 @@ async def _get_current_value(db: AsyncSession, limit_type: str) -> int:
             )
         ).scalar_one()
         return count
-    # content_count / storage_capacity 待开发，返回占位值
+
+    # content_count / storage_capacity 的当前使用量待后续业务接入时再实现
     return 0

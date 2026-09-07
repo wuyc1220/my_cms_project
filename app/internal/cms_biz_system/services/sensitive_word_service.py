@@ -19,6 +19,7 @@ from app.internal.cms_biz_system.schemas.sensitive_word import (
     SensitiveWordUpdate,
 )
 from app.common.schemas import PaginatedResponse
+from app.config import app_tz
 
 from loguru import logger
 from app.common.core.i18n import get_msg
@@ -104,23 +105,32 @@ async def get_sensitive_word(db: AsyncSession, word_id: int) -> SensitiveWord:
 async def create_sensitive_word(
     db: AsyncSession, data: SensitiveWordCreate
 ) -> SensitiveWord:
+    # 敏感词以"关键词"为唯一身份（与导入逻辑、唯一索引一致）。
+    # 不过滤软删除行：命中软删除行时复活并更新（与导入路径行为一致），
+    # 避免在仍保留旧版非部分唯一约束的环境（软删除行占用唯一键）上 INSERT 撞键导致 500。
     existing = (
         await db.execute(
-            select(SensitiveWord).where(
-                SensitiveWord.keyword == data.keyword,
-                SensitiveWord.type_code == data.type_code,
-                SensitiveWord.is_deleted == False,
-            )
+            select(SensitiveWord)
+            .where(SensitiveWord.keyword == data.keyword)
+            .order_by(SensitiveWord.is_deleted.asc(), SensitiveWord.id.asc())
+            .limit(1)
         )
     ).scalar_one_or_none()
-    if existing:
+    if existing and not existing.is_deleted:
         raise BusinessException(ErrorCode.SENSITIVE_WORD_EXISTS, get_msg("SENSITIVE_WORD_EXISTS"))
-    word = SensitiveWord(
-        keyword=data.keyword,
-        type_code=data.type_code,
-        status=data.status,
-    )
-    db.add(word)
+    if existing:
+        # 复活软删除行，类型/状态以本次提交为准
+        existing.type_code = data.type_code
+        existing.status = data.status
+        existing.is_deleted = False
+        word = existing
+    else:
+        word = SensitiveWord(
+            keyword=data.keyword,
+            type_code=data.type_code,
+            status=data.status,
+        )
+        db.add(word)
     await db.commit()
     await db.refresh(word)
     SensitiveCheckService.get_instance().invalidate_cache()
@@ -133,12 +143,11 @@ async def update_sensitive_word(
     new_keyword = data.keyword if data.keyword is not None else word.keyword
     new_type_code = data.type_code if data.type_code is not None else word.type_code
 
-    if new_keyword != word.keyword or new_type_code != word.type_code:
+    if new_keyword != word.keyword:
         existing = (
             await db.execute(
                 select(SensitiveWord).where(
                     SensitiveWord.keyword == new_keyword,
-                    SensitiveWord.type_code == new_type_code,
                     SensitiveWord.id != word_id,
                     SensitiveWord.is_deleted == False,
                 )
@@ -214,11 +223,39 @@ async def export_excel(db: AsyncSession, ids: list[int]) -> bytes:
         )
     ).scalars().all()
 
+    # 查询 Sensitive_Word_Type 字典树，构建 type_code → type_name 映射
+    type_root = (
+        await db.execute(
+            select(DictNode).where(
+                DictNode.parent_id.is_(None),
+                DictNode.code == "Sensitive_Word_Type",
+                DictNode.is_deleted == False,
+            )
+        )
+    ).scalar_one_or_none()
+    type_name_map: dict[str, str] = {}
+    if type_root is not None:
+        children = (
+            await db.execute(
+                select(DictNode).where(
+                    DictNode.parent_id == type_root.id,
+                    DictNode.is_deleted == False,
+                )
+            )
+        ).scalars().all()
+        type_name_map = {c.code: c.name for c in children}
+
     wb = openpyxl.Workbook()
     ws = wb.active
-    ws.title = "敏感词"
+    ws.title = get_msg("SENSITIVE_WORD_EXPORT_SHEET_TITLE")
 
-    headers = ["关键词", "类型", "状态", "创建时间", "最后更新时间"]
+    headers = [
+        get_msg("SENSITIVE_WORD_EXPORT_COL_KEYWORD"),
+        get_msg("SENSITIVE_WORD_EXPORT_COL_TYPE"),
+        get_msg("SENSITIVE_WORD_EXPORT_COL_STATUS"),
+        get_msg("SENSITIVE_WORD_EXPORT_COL_CREATED_AT"),
+        get_msg("SENSITIVE_WORD_EXPORT_COL_UPDATED_AT"),
+    ]
     header_fill = PatternFill(start_color="1677FF", end_color="1677FF", fill_type="solid")
     header_font = Font(color="FFFFFF", bold=True)
 
@@ -233,13 +270,49 @@ async def export_excel(db: AsyncSession, ids: list[int]) -> bytes:
         ws.column_dimensions[ws.cell(row=1, column=col).column_letter].width = width
 
     for row_idx, word in enumerate(words, 2):
-        created = word.created_at.strftime("%Y-%m-%d %H:%M:%S") if word.created_at else ""
-        updated = word.updated_at.strftime("%Y-%m-%d %H:%M:%S") if word.updated_at else ""
+        created = word.created_at.astimezone(app_tz).strftime("%Y-%m-%d %H:%M:%S") if word.created_at else ""
+        updated = word.updated_at.astimezone(app_tz).strftime("%Y-%m-%d %H:%M:%S") if word.updated_at else ""
+        status_text = (
+            get_msg("SENSITIVE_WORD_EXPORT_STATUS_ACTIVE")
+            if word.status == "active"
+            else get_msg("SENSITIVE_WORD_EXPORT_STATUS_INACTIVE")
+        )
         ws.cell(row=row_idx, column=1, value=word.keyword)
-        ws.cell(row=row_idx, column=2, value=word.type_code)
-        ws.cell(row=row_idx, column=3, value="已启用" if word.status == "active" else "已禁用")
+        ws.cell(row=row_idx, column=2, value=type_name_map.get(word.type_code, word.type_code))
+        ws.cell(row=row_idx, column=3, value=status_text)
         ws.cell(row=row_idx, column=4, value=created)
         ws.cell(row=row_idx, column=5, value=updated)
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return buf.read()
+
+
+def generate_import_template() -> bytes:
+    """生成导入模板（表头按请求语言本地化，列结构与 import_excel 解析一致）"""
+    import openpyxl
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = get_msg("SENSITIVE_WORD_EXPORT_SHEET_TITLE")
+
+    headers = [
+        get_msg("SENSITIVE_WORD_EXPORT_COL_KEYWORD"),
+        get_msg("SENSITIVE_WORD_EXPORT_COL_TYPE"),
+        get_msg("SENSITIVE_WORD_EXPORT_COL_STATUS"),
+    ]
+    header_fill = PatternFill(start_color="1677FF", end_color="1677FF", fill_type="solid")
+    header_font = Font(color="FFFFFF", bold=True)
+
+    for col, header in enumerate(headers, 1):
+        cell = ws.cell(row=1, column=col, value=header)
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+
+    for col, width in enumerate([24, 20, 12], 1):
+        ws.column_dimensions[ws.cell(row=1, column=col).column_letter].width = width
 
     buf = io.BytesIO()
     wb.save(buf)
@@ -297,16 +370,45 @@ async def import_excel(db: AsyncSession, file: UploadFile) -> ImportResult:
     wb = load_workbook(io.BytesIO(content), read_only=True)
     ws = wb.active
 
+    # 表头校验：兼容中英文模板（关键词/Keyword、类型/Type、状态/Status），按表头名定位列
+    header_aliases = {
+        "keyword": {"关键词", "Keyword"},
+        "type": {"类型", "Type"},
+        "status": {"状态", "Status"},
+    }
+    header_row = next(ws.iter_rows(min_row=1, max_row=1, values_only=True), None)
+    if not header_row:
+        wb.close()
+        raise BusinessException(ErrorCode.INVALID_FILE_FORMAT, get_msg("INVALID_FILE_FORMAT"))
+    actual_headers = [str(c).strip() if c is not None else "" for c in header_row]
+    col_index: dict[str, int] = {}
+    for field, aliases in header_aliases.items():
+        for idx, h in enumerate(actual_headers):
+            if h in aliases:
+                col_index[field] = idx
+                break
+    missing = [f for f in header_aliases if f not in col_index]
+    if missing:
+        wb.close()
+        raise BusinessException(ErrorCode.INVALID_FILE_FORMAT, get_msg("INVALID_FILE_FORMAT"))
+
     rows = list(ws.iter_rows(min_row=2, values_only=True))
     wb.close()
 
+    def _cell(row: tuple, field: str) -> str:
+        idx = col_index.get(field)
+        if idx is None or idx >= len(row):
+            return ""
+        v = row[idx]
+        return str(v).strip() if v is not None else ""
+
     result = ImportResult()
     for row in rows:
-        if not row or not row[0]:
+        if not row:
             continue
-        keyword = str(row[0]).strip()
-        type_name = str(row[1]).strip() if len(row) > 1 and row[1] else ""
-        status_str = str(row[2]).strip() if len(row) > 2 and row[2] else "active"
+        keyword = _cell(row, "keyword")
+        type_name = _cell(row, "type")
+        status_str = _cell(row, "status") or "active"
 
         if not keyword or not type_name:
             continue
@@ -314,23 +416,27 @@ async def import_excel(db: AsyncSession, file: UploadFile) -> ImportResult:
         result.total += 1
         type_code = await _get_or_create_type_code(db, type_name)
 
-        if status_str in ("已禁用", "inactive", "Inactive"):
+        if status_str.lower() in ("已禁用", "inactive"):
             status_val = "inactive"
         else:
             status_val = "active"
 
+        # 需求 3.1.6.2：敏感词以"关键词"为唯一身份，已存在则更新（类型/状态以最新导入为准）。
+        # 不过滤软删除行：命中软删除行时复活并更新，避免撞 keyword 部分唯一索引；
+        # is_deleted 升序保证优先命中未删除行（false < true）。
         existing = (
             await db.execute(
-                select(SensitiveWord).where(
-                    SensitiveWord.keyword == keyword,
-                    SensitiveWord.type_code == type_code,
-                    SensitiveWord.is_deleted == False,
-                )
+                select(SensitiveWord)
+                .where(SensitiveWord.keyword == keyword)
+                .order_by(SensitiveWord.is_deleted.asc(), SensitiveWord.id.asc())
+                .limit(1)
             )
         ).scalar_one_or_none()
 
         if existing:
+            existing.type_code = type_code
             existing.status = status_val
+            existing.is_deleted = False
             result.updated += 1
         else:
             db.add(

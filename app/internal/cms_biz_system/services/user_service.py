@@ -2,6 +2,8 @@
 用户业务逻辑层
 只负责业务规则校验和流程编排，数据访问委托给 repository
 """
+from datetime import datetime, timezone
+
 from passlib.context import CryptContext
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -52,6 +54,32 @@ async def _get_user_or_404(db: AsyncSession, user_id: int) -> User:
     return user
 
 
+async def _assert_user_not_in_use(db: AsyncSession, user: User) -> None:
+    """删除前校验用户是否被引用：被数据权限授权或存在未完成任务分配时禁止删除"""
+    # 局部导入避免模块级循环依赖
+    from sqlalchemy import select
+    from app.internal.cms_biz_system.models.content_auth import ContentAuth
+    from app.internal.cms_biz_package.models.task import Task
+
+    name = user.display_name or user.username
+    in_auth = (await db.execute(
+        select(ContentAuth.id).where(
+            ContentAuth.user_id == user.id, ContentAuth.is_deleted.is_(False)
+        ).limit(1)
+    )).scalar_one_or_none()
+    if in_auth:
+        raise BusinessException(ErrorCode.USER_AUTH_IN_USE, get_msg("USER_AUTH_IN_USE", name=name))
+    pending_task = (await db.execute(
+        select(Task.id).where(
+            Task.assignee_id == user.id,
+            Task.is_deleted.is_(False),
+            Task.task_status != "Completed",
+        ).limit(1)
+    )).scalar_one_or_none()
+    if pending_task:
+        raise BusinessException(ErrorCode.USER_HAS_ASSIGNED_TASKS, get_msg("USER_HAS_ASSIGNED_TASKS", name=name))
+
+
 # ── 用户 CRUD ───────────────────────────────────────────────
 
 async def list_users(
@@ -93,6 +121,15 @@ async def create_user(db: AsyncSession, data: UserCreate) -> User:
     if existing:
         raise BusinessException(ErrorCode.USERNAME_EXISTS, get_msg("USERNAME_EXISTS"))
 
+    from app.internal.cms_biz_system.services.config_service import get_config_int
+    from app.internal.cms_biz_system.services.password_validator import validate_password
+
+    min_length = await get_config_int(db, "PASSWORD_MIN_LENGTH", 8)
+    pattern_min_len = await get_config_int(db, "PASSWORD_PATTERN_MIN_LEN", 6)
+    is_valid, errors = validate_password(data.password, data.username, min_length, pattern_min_len)
+    if not is_valid:
+        raise BusinessException(ErrorCode.VALIDATION_ERROR, "; ".join(errors))
+
     user = User(
         username=data.username,
         password_hash=pwd_context.hash(data.password),
@@ -100,6 +137,7 @@ async def create_user(db: AsyncSession, data: UserCreate) -> User:
         email=data.email,
         phone_number=data.phone_number,
         status=data.status,
+        password_changed_at=datetime.now(timezone.utc),
     )
     await user_repository.add_user(db, user)
 
@@ -140,7 +178,6 @@ async def reset_password(
 ) -> None:
     from app.internal.cms_biz_system.services.config_service import get_config_int
     from app.internal.cms_biz_system.services.password_validator import validate_password
-    from datetime import datetime, timezone
 
     user = await _get_user_or_404(db, user_id)
     logger.info(f"reset_password 入参: user_id={user_id}")
@@ -149,7 +186,8 @@ async def reset_password(
         raise BusinessException(ErrorCode.PASSWORDS_DO_NOT_MATCH, get_msg("PASSWORDS_DO_NOT_MATCH"))
 
     min_length = await get_config_int(db, "PASSWORD_MIN_LENGTH", 8)
-    is_valid, errors = validate_password(new_password, user.username, min_length)
+    pattern_min_len = await get_config_int(db, "PASSWORD_PATTERN_MIN_LEN", 6)
+    is_valid, errors = validate_password(new_password, user.username, min_length, pattern_min_len)
     if not is_valid:
         raise BusinessException(ErrorCode.VALIDATION_ERROR, "; ".join(errors))
 
@@ -158,7 +196,6 @@ async def reset_password(
 
     user.password_hash = pwd_context.hash(new_password)
     user.password_changed_at = datetime.now(timezone.utc)
-    user.force_change_password = False
     await db.commit()
 
 
@@ -176,8 +213,12 @@ async def toggle_user_status(db: AsyncSession, user_id: int, new_status: str) ->
 async def batch_update_user_status(db: AsyncSession, ids: list[int], new_status: str) -> int:
     users = await user_repository.get_users_by_ids(db, ids)
     logger.info(f"batch_update_user_status 入参: ids={ids}, new_status={new_status}")
+    # 启用/禁用时跳过已处于目标状态的用户（批量启用跳过已启用、批量禁用跳过已禁用）
+    if new_status != "deleted":
+        users = [u for u in users if u.status != new_status]
     for user in users:
         if new_status == "deleted":
+            await _assert_user_not_in_use(db, user)
             user.is_deleted = True
         else:
             user.status = new_status
@@ -191,6 +232,7 @@ async def batch_update_user_status(db: AsyncSession, ids: list[int], new_status:
 async def delete_user(db: AsyncSession, user_id: int) -> None:
     user = await _get_user_or_404(db, user_id)
     logger.info(f"delete_user 入参: user_id={user_id}")
+    await _assert_user_not_in_use(db, user)
     user.is_deleted = True
     await db.commit()
 
@@ -199,6 +241,7 @@ async def batch_delete_users(db: AsyncSession, ids: list[int]) -> int:
     users = await user_repository.get_users_by_ids(db, ids)
     logger.info(f"batch_delete_users 入参: ids={ids}")
     for user in users:
+        await _assert_user_not_in_use(db, user)
         user.is_deleted = True
     await db.commit()
     return len(users)
@@ -215,18 +258,18 @@ async def change_password(
     logger.info(f"change_password 入参: user_id={user_id}, username={username}")
     from app.internal.cms_biz_system.services.config_service import get_config_int
     from app.internal.cms_biz_system.services.password_validator import validate_password
-    from datetime import datetime, timezone
 
     user = await _get_user_or_404(db, user_id)
 
     min_length = await get_config_int(db, "PASSWORD_MIN_LENGTH", 8)
+    pattern_min_len = await get_config_int(db, "PASSWORD_PATTERN_MIN_LEN", 6)
 
     if not pwd_context.verify(old_password, user.password_hash):
         raise BusinessException(ErrorCode.OLD_PASSWORD_INCORRECT, get_msg("OLD_PASSWORD_INCORRECT"))
     if new_password != confirm_password:
         raise BusinessException(ErrorCode.PASSWORDS_DO_NOT_MATCH, get_msg("PASSWORDS_DO_NOT_MATCH"))
 
-    is_valid, errors = validate_password(new_password, username, min_length)
+    is_valid, errors = validate_password(new_password, username, min_length, pattern_min_len)
     if not is_valid:
         raise BusinessException(ErrorCode.VALIDATION_ERROR, "; ".join(errors))
     if pwd_context.verify(new_password, user.password_hash):
@@ -234,5 +277,4 @@ async def change_password(
 
     user.password_hash = pwd_context.hash(new_password)
     user.password_changed_at = datetime.now(timezone.utc)
-    user.force_change_password = False
     await db.commit()

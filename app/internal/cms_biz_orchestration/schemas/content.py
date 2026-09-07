@@ -31,6 +31,7 @@ class ContentLicenseRef(BaseModel):
     provider_id: Optional[int] = None
     provider_name: str
     service_type: str
+    service_type_name: Optional[str] = None
     start_date: Optional[str] = None
     end_date: Optional[str] = None
     platforms: Optional[list[LicensePlatformItem]] = None
@@ -44,9 +45,10 @@ class ContentListItem(BaseModel):
     content_type: str
     title: str
     status: str
+    external_id: Optional[str] = None
     parent_id: Optional[int] = None
     parent_title: Optional[str] = None
-    genre_id: Optional[int] = None
+    genre_ids: Optional[list[int]] = None
     genre_name: Optional[str] = None
     custom_tag_ids: Optional[list[int]] = None
     custom_tag_names: Optional[list[str]] = None
@@ -62,10 +64,16 @@ class ContentListItem(BaseModel):
     is_archived: Optional[bool] = None
     source_schedule_id: Optional[int] = None
     is_discarded: bool = False
+    cutv_enable: Optional[bool] = None
+    assignee_name: Optional[str] = None
+    # 内容编排任务（arrangement）的开始/结束时间
+    # 需求 3.6.6/3.6.7：子内容列表展示"对应的内容编排任务"的进展（区别于 SCHEDULE 专用的 begin_time/end_time）
+    task_start_time: Optional[datetime] = None
+    task_end_time: Optional[datetime] = None
 
     model_config = ConfigDict(from_attributes=True)
 
-    @field_validator("begin_time", "end_time", "created_at", mode="after")
+    @field_validator("begin_time", "end_time", "created_at", "task_start_time", "task_end_time", mode="after")
     @classmethod
     def _ensure_utc_on_read(cls, v):
         if isinstance(v, datetime) and v.tzinfo is None:
@@ -87,13 +95,13 @@ class ContentCreate(BaseModel):
     """新建内容请求体。动态字段随 content_type 变化。"""
     title: str = Field(..., max_length=100)
     content_type: str
-    genre_id: Optional[int] = None
+    genre_ids: Optional[list[int]] = None
     custom_tag_ids: Optional[list[int]] = None
     parent_id: Optional[int] = None
     sequence: Optional[int] = None
     series_type: Optional[int] = None
     series_ordinal: Optional[int] = None
-    volumn_count: Optional[int] = None
+    volumn_count: Optional[int] = Field(None, ge=0, description="集/季数量，0表示空剧头")
     season_details: Optional[list[SeasonDetailRow]] = None
     begin_time: Optional[datetime] = None
     end_time: Optional[datetime] = None
@@ -112,7 +120,7 @@ class ContentCreate(BaseModel):
 class ContentUpdate(BaseModel):
     """编辑内容请求体，所有字段均可选。"""
     title: Optional[str] = Field(None, max_length=100)
-    genre_id: Optional[int] = None
+    genre_ids: Optional[list[int]] = None
     custom_tag_ids: Optional[list[int]] = None
     parent_id: Optional[int] = None
     sequence: Optional[int] = None
@@ -176,11 +184,11 @@ class ContentQueryParams(BaseModel):
     """内容列表查询参数（供 API 层使用）。"""
     page: int = 1
     page_size: int = 10
-    content_id: Optional[int] = None
+    external_id: Optional[str] = None
     title: Optional[str] = None
     content_types: Optional[list[str]] = None
     statuses: Optional[list[str]] = None
-    genre_id: Optional[int] = None
+    genre_ids: Optional[list[int]] = None
     created_from: Optional[str] = None
     created_to: Optional[str] = None
     without_license: bool = False
@@ -198,11 +206,12 @@ class VodContentListItem(BaseModel):
     content_type: str
     title: str
     status: str
-    genre_id: Optional[int] = None
+    genre_ids: Optional[list[int]] = None
     genre_name: Optional[str] = None
     type_name: Optional[str] = None
     category_name: Optional[str] = None
-    takedown_date: Optional[str] = None
+    custom_tag_names: list[str] = []
+    unpublish_date: Optional[str] = None
     publish_date: Optional[str] = None
     poster_url: Optional[str] = None
     package_names: list[str] = []
@@ -210,6 +219,7 @@ class VodContentListItem(BaseModel):
     license_start: Optional[str] = None
     license_end: Optional[str] = None
     created_at: Optional[datetime] = None
+    is_discarded: bool = False
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -225,7 +235,7 @@ class AdjacentContentResponse(BaseModel):
 class BatchImportItem(BaseModel):
     """批量导入的每条内容。"""
     title: str = Field(..., max_length=100)
-    content_type: str = Field(..., pattern="^(EPISODE|SERIES)$")
+    content_type: str = Field(..., pattern="^(EPISODE|SERIES|SEASON_SERIES)$")
     series_ordinal: Optional[int] = None
     sequence: Optional[int] = None
     series_type: Optional[int] = None

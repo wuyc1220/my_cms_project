@@ -132,7 +132,9 @@ class ObjectPublishStatus(Base):
         self.is_published = True
         self.last_action = action
 
-        now = datetime.now(timezone.utc)
+        # 使用带时区的当前时间，与数据库会话时区保持一致
+        from app.config import app_tz
+        now = datetime.now(app_tz)
         if not self.first_publish_time:
             self.first_publish_time = now
         self.last_publish_time = now

@@ -7,7 +7,7 @@ from app.common.schemas import BatchDeleteRequest
 from app.internal.cms_biz_metada.schemas.basic import CategoryCreate, CategoryListItem, CategoryUpdate
 from app.common.core.i18n import get_msg
 from app.common.core.exceptions import NotFoundException, BusinessException, ErrorCode
-from app.internal.cms_biz_package.models.package import ContentCategory
+from app.internal.cms_biz_package.models.package import ContentCategory, ContentGenre
 from app.internal.cms_biz_metada.models.basic import Genre
 from app.internal.cms_biz_system.models.dict import DictNode
 
@@ -233,6 +233,7 @@ async def batch_delete_categories(db: AsyncSession, req: BatchDeleteRequest) -> 
         ).scalar_one_or_none()
         if child_exists is not None:
             raise BusinessException(
+                ErrorCode.CATEGORY_HAS_CHILDREN,
                 get_msg("CATEGORY_HAS_CHILDREN_NAME", name=cat.name),
             )
         content_exists = (
@@ -240,6 +241,7 @@ async def batch_delete_categories(db: AsyncSession, req: BatchDeleteRequest) -> 
         ).scalar_one_or_none()
         if content_exists is not None:
             raise BusinessException(
+                ErrorCode.CATEGORY_HAS_CONTENTS,
                 get_msg("CATEGORY_HAS_CONTENTS_NAME", name=cat.name),
             )
     for cat in cats:
@@ -259,21 +261,35 @@ async def get_category_contents(db: AsyncSession, category_id: int) -> list[dict
         )
     ).scalars().all()
 
-    genre_ids = {link.content.genre_id for link in links if link.content.genre_id}
+    # 从 content_genre 中间表批量查询所有 genre_id
+    content_ids = [link.content.id for link in links]
+    genre_rows = (await db.execute(
+        select(ContentGenre.content_id, ContentGenre.genre_id)
+        .where(ContentGenre.content_id.in_(content_ids), ContentGenre.is_deleted.is_(False))
+    )).all()
+
+    content_genre_map: dict[int, list[int]] = {}
+    all_genre_ids: set[int] = set()
+    for row in genre_rows:
+        content_genre_map.setdefault(row.content_id, []).append(row.genre_id)
+        all_genre_ids.add(row.genre_id)
+
     genre_map = {}
-    if genre_ids:
-        genres = (await db.execute(select(Genre).where(Genre.id.in_(genre_ids), Genre.is_deleted.is_(False)))).scalars().all()
+    if all_genre_ids:
+        genres = (await db.execute(select(Genre).where(Genre.id.in_(all_genre_ids), Genre.is_deleted.is_(False)))).scalars().all()
         genre_map = {g.id: g.name for g in genres}
 
     result = []
-    for idx, link in enumerate(links):
+    for link in links:
         content = link.content
+        gids = content_genre_map.get(content.id, [])
+        genre_names = [genre_map[gid] for gid in gids if gid in genre_map]
         result.append({
             "id": content.id,
-            "sequence": idx + 1,
+            "sequence": link.sequence if link.sequence is not None else 0,
             "content_name": content.title,
             "content_type": content.content_type,
-            "genre": genre_map.get(content.genre_id, "") if content.genre_id else "",
+            "genre": ", ".join(genre_names) if genre_names else "",
             "status": content.status,
         })
     return result

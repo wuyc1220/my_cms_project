@@ -285,7 +285,7 @@ async def retry_task(db: AsyncSession, task_id: int) -> MetadataCrawlTask:
 
     if not source:
         task.crawl_status = "Failed"
-        task.error_message = "数据源已删除"
+        task.error_message = get_msg("CRAWL_SOURCE_DELETED")
         task.completed_at = datetime.now()
         await db.flush()
         return task

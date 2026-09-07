@@ -7,7 +7,7 @@
 from datetime import datetime
 from typing import Optional
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 
 # ═══════════════════════════════════════════════════════════
@@ -18,18 +18,20 @@ class MovieBase(BaseModel):
     """媒资实体基础字段。"""
     file_name: str
     file_path: str
+    relative_path: Optional[str] = None
     file_size: int = 0
     movie_type: int
     sequence: Optional[int] = None
     audio_type: Optional[str] = None
     screen_format: Optional[str] = None
     closed_captioning: bool = True
-    duration: int
-    definition: str
+    # 字幕（Type=3）REGIST 不要求 Duration/Definition，允许为空
+    duration: Optional[int] = None
+    definition: Optional[str] = None
     mediaservice: Optional[str] = None
     encryption: bool = True
     publish_flag: bool = True
-    deeplink: Optional[str] = None
+    deeplink: Optional[str] = Field(None, max_length=1000)
 
 
 class MovieCreate(MovieBase):
@@ -41,6 +43,7 @@ class MovieUpdate(BaseModel):
     """更新媒资实体请求体（所有字段可选）。"""
     file_name: Optional[str] = None
     file_path: Optional[str] = None
+    relative_path: Optional[str] = None
     file_size: Optional[int] = None
     movie_type: Optional[int] = None
     sequence: Optional[int] = None
@@ -52,7 +55,7 @@ class MovieUpdate(BaseModel):
     mediaservice: Optional[str] = None
     encryption: Optional[bool] = None
     publish_flag: Optional[bool] = None
-    deeplink: Optional[str] = None
+    deeplink: Optional[str] = Field(None, max_length=1000)
 
 
 class MovieItem(MovieBase):

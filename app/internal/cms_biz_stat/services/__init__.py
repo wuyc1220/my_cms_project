@@ -4,12 +4,11 @@
 提供看板数据统计查询和用户配置管理服务。
 """
 
-from datetime import datetime, date, timedelta
+from datetime import date, timedelta
 from typing import Any
 
-from fastapi import HTTPException, status
 from loguru import logger
-from sqlalchemy import func, select, case, or_
+from sqlalchemy import func, select, case
 from sqlalchemy.ext.asyncio import AsyncSession
 import json
 
@@ -31,22 +30,17 @@ from app.internal.cms_biz_stat.schemas import (
     UserDashboardConfigUpdate,
 )
 from app.internal.cms_biz_metada.models.basic import Genre
-from app.internal.cms_biz_orchestration.models.content_metadata import (
-    ContentMetadata,
-    SeriesMetadata,
-)
-from app.internal.cms_biz_package.models.package import Content, ContentPackage, Package, PackagePlatform
+from app.internal.cms_biz_package.models.package import Content, ContentGenre
 from app.internal.cms_biz_package.models.task import Task
 from app.internal.cms_biz_scp.models.trade import License, LicenseContent, LicensePlatform
 from app.internal.cms_biz_system.models.dict import DictNode
-from app.internal.cms_biz_system.models.operation_log import OperationLog
 from app.internal.cms_biz_system.models.user import User
-from app.internal.cms_biz_system.services.dict_service import get_dict_children_by_code
 from app.internal.cms_biz_system.services.config_service import get_config_int
+from app.internal.cms_biz_system.services.dict_service import get_dict_children_by_code
+from app.internal.cms_biz_system.services.operation_log_service import OperationType, write_log
 from app.internal.cms_biz_system.services.data_auth_filter import (
     apply_content_data_auth,
-    has_task_assign_role,
-    TASK_RELATED_MODULE_CODES,
+    has_task_permission,
 )
 
 
@@ -65,13 +59,13 @@ DEFAULT_MODULE_CONFIG = [
     {"code": "not_assigned_tasks", "name": "Not Assigned Tasks Table | 未分配任务列表", "visible": True, "sort_order": 8},
 ]
 
-# 计算状态（不从字典表获取，由系统计算得出）
+# 计算状态（不从 Ingest_Status 字典获取，由系统按业务规则计算得出，仅用于 Content Status Count 模块展示）
+# NearExpired：状态为 Published 且存在许可证 end_date 在 [today, today+NEAR_EXPIRY_DAYS] 内的内容
+# Deleted：is_discarded=true 的内容（与 VOD 列表 Deleted=YES 筛选口径一致）
 COMPUTED_STATUSES = [
-    {"code": "Expired", "name": "Expired", "visible": True, "sort_order": 97},
-    {"code": "NearExpiry", "name": "NearExpiry", "visible": True, "sort_order": 98},
-    {"code": "Deleted", "name": "Deleted", "visible": True, "sort_order": 99},
+    {"code": "NearExpired", "name": "Near-Expired"},
+    {"code": "Deleted", "name": "Deleted"},
 ]
-
 
 # ═══════════════════════════════════════════════════════════
 # 2. 用户配置服务
@@ -105,7 +99,7 @@ class DashboardConfigService:
         return first_lang.code if first_lang else None
 
     async def _sync_genre_config(self, current_config: list[dict]) -> list[dict]:
-        """同步题材配置，按 Multi_Languages 第一种语言过滤，保留用户可见性设置"""
+        """同步题材配置，按 Multi_Languages 第一种语言过滤，保留用户可见性与排序设置"""
         # 获取 Multi_Languages 第一种语言
         default_language = await self._get_default_language()
 
@@ -118,47 +112,74 @@ class DashboardConfigService:
         genre_result = await self.db.execute(genre_query)
         db_genres = genre_result.scalars().all()
 
-        # 将当前配置转为字典，保留用户的 visible 设置
-        current_visible_map = {item.get("name"): item.get("visible", True) for item in current_config if item.get("name")}
+        # 将当前配置转为字典，保留用户的 visible / sort_order 设置（以 id 为键，避免跨语言同名/改名问题）
+        current_map = {
+            item.get("id"): item for item in current_config if item.get("id") is not None
+        }
 
-        # 构建新的题材配置
+        # 构建新的题材配置：已有项保留用户设置，新增项排序值置 None 待分配
         genre_config = []
-        for i, g in enumerate(db_genres):
+        for g in db_genres:
+            prev = current_map.get(g.id)
             genre_config.append({
                 "id": g.id,
                 "name": g.name,
-                "visible": current_visible_map.get(g.name, True),  # 保留用户设置，新增默认为True
-                "sort_order": i + 1
+                "visible": prev.get("visible", True) if prev else True,  # 保留用户设置，新增默认为True
+                "sort_order": prev.get("sort_order") if prev else None,  # 保留用户排序，新增待分配
             })
+
+        # 新增项分配到列表末尾，最终按 sort_order 排序输出（sort_order 相同时以 id 为次键，保证稳定）
+        next_order = max(
+            (item["sort_order"] for item in genre_config if item["sort_order"] is not None),
+            default=0,
+        ) + 1
+        for item in genre_config:
+            if item["sort_order"] is None:
+                item["sort_order"] = next_order
+                next_order += 1
+        genre_config.sort(key=lambda x: (x["sort_order"], x["id"]))
 
         return genre_config
 
     async def _sync_content_status_config(self, current_config: list[dict]) -> list[dict]:
-        """同步内容状态配置，从 Ingest_Status 字典获取，保留用户可见性设置，同时保留计算状态"""
+        """同步内容状态配置：Ingest_Status 字典状态 + 计算状态（NearExpired/Deleted），保留用户可见性与排序设置"""
         # 从字典获取 Ingest_Status 所有子节点
         ingest_status_items = await get_dict_children_by_code(self.db, "Ingest_Status")
 
-        # 将当前配置转为字典，保留用户的 visible 设置（以 code 为 key）
-        current_visible_map = {item.get("code"): item.get("visible", True) for item in current_config if item.get("code")}
+        # 将当前配置转为字典，保留用户的 visible / sort_order 设置（以 code 为 key）
+        current_map = {item.get("code"): item for item in current_config if item.get("code")}
 
-        # 构建状态配置（从字典获取的状态）
+        # 构建状态配置（字典状态 + 计算状态），已有项保留用户设置，新增项排序值置 None 待分配
         status_config = []
-        for i, item in enumerate(ingest_status_items):
+        for item in ingest_status_items:
+            prev = current_map.get(item.code)
             status_config.append({
                 "code": item.code,
                 "name": item.name,  # 使用字典中的 name（英文）
-                "visible": current_visible_map.get(item.code, True),  # 保留用户设置，新增默认为True
-                "sort_order": i + 1
+                "visible": prev.get("visible", True) if prev else True,  # 保留用户设置，新增默认为True
+                "sort_order": prev.get("sort_order") if prev else None,  # 保留用户排序，新增待分配
             })
 
-        # 添加计算状态（Expired, NearExpiry）
+        # 追加计算状态（NearExpired/Deleted，仅 Content Status Count 模块展示）
         for computed in COMPUTED_STATUSES:
+            prev = current_map.get(computed["code"])
             status_config.append({
                 "code": computed["code"],
-                "name": computed["name"],  # 使用中文名
-                "visible": current_visible_map.get(computed["code"], True),
-                "sort_order": computed["sort_order"]
+                "name": computed["name"],
+                "visible": prev.get("visible", True) if prev else True,
+                "sort_order": prev.get("sort_order") if prev else None,
             })
+
+        # 新增项分配到列表末尾，最终按 sort_order 排序输出
+        next_order = max(
+            (item["sort_order"] for item in status_config if item["sort_order"] is not None),
+            default=0,
+        ) + 1
+        for item in status_config:
+            if item["sort_order"] is None:
+                item["sort_order"] = next_order
+                next_order += 1
+        status_config.sort(key=lambda x: x["sort_order"])
 
         return status_config
 
@@ -218,7 +239,7 @@ class DashboardConfigService:
                 config.content_genre_config = synced_genre_config
                 await self.db.flush()
 
-            # 同步内容状态配置（从字典获取，保留用户可见性设置）
+            # 同步内容状态配置（字典状态 + 计算状态，保留用户可见性设置）
             synced_status_config = await self._sync_content_status_config(config.content_status_config)
             current_status_list = list(config.content_status_config) if config.content_status_config else []
             if synced_status_config != current_status_list:
@@ -228,19 +249,16 @@ class DashboardConfigService:
         return config
 
     async def get_config_response(self, user_id: int, current_user: User | None = None) -> UserDashboardConfigResponse:
-        """获取配置响应"""
+        """获取配置响应。
+
+        注意：此处返回完整的 module_config（不做权限剔除），任务模块显隐
+        由前端基于 /dashboard/ 返回的 can_see_task_modules 过滤。避免无权限
+        用户在自定义弹窗保存后被剔除的模块整体覆盖 DB，导致权限恢复后模块
+        永久丢失。
+        """
         config = await self.get_or_create_config(user_id)
 
-        response = UserDashboardConfigResponse.model_validate(config)
-
-        if current_user is not None:
-            can_see_task = await has_task_assign_role(self.db, current_user)
-            if not can_see_task:
-                response.module_config = [
-                    m for m in response.module_config if m.code not in TASK_RELATED_MODULE_CODES
-                ]
-
-        return response
+        return UserDashboardConfigResponse.model_validate(config)
 
     async def update_config(
         self, user_id: int, data: UserDashboardConfigUpdate, user_name: str | None = None
@@ -262,18 +280,22 @@ class DashboardConfigService:
         synced_status_config = await self._sync_content_status_config(user_status_config)
         config.content_status_config = synced_status_config
 
-        config.content_genre_config = [g.model_dump() for g in data.content_genre_config]
+        # 同步用户提交的题材配置（保留用户可见性与排序设置，添加新增的题材）
+        user_genre_config = [g.model_dump() for g in data.content_genre_config]
+        synced_genre_config = await self._sync_genre_config(user_genre_config)
+        config.content_genre_config = synced_genre_config
         config.updated_by = user_id
 
         await self.db.flush()
 
-        # 记录操作日志
-        operation_log = OperationLog(
+        # 记录操作日志（操作类型与内容均走 i18n，读时按请求语言翻译）
+        await write_log(
+            self.db,
             user_id=user_id,
             user_name=user_name,
-            operation_type="UPDATE",
-            operation_object="UserDashboardConfig",
-            operation_content="更新用户看板配置",
+            operation_type=OperationType.DASHBOARD_CONFIG_UPDATE,
+            operation_object_code="OBJ_USER_DASHBOARD_CONFIG",
+            operation_content_code="LOG_DASHBOARD_CONFIG_UPDATE",
             previous_value=json.dumps(previous_value, ensure_ascii=False),
             updated_value=json.dumps({
                 "module_config": config.module_config,
@@ -282,8 +304,6 @@ class DashboardConfigService:
             }, ensure_ascii=False),
             result="success",
         )
-        self.db.add(operation_log)
-        await self.db.flush()
 
         return UserDashboardConfigResponse.model_validate(config)
 
@@ -300,7 +320,7 @@ class DashboardConfigService:
 
         # 重新获取题材配置（按 Multi_Languages 第一种语言过滤，重置时所有题材默认可见）
         genre_config = await self._sync_genre_config([])
-        # 重新获取内容状态配置（从字典获取，重置时所有状态默认可见）
+        # 重新获取内容状态配置（字典状态 + 计算状态，重置时所有状态默认可见）
         content_status_config = await self._sync_content_status_config([])
 
         config.module_config = DEFAULT_MODULE_CONFIG
@@ -310,13 +330,14 @@ class DashboardConfigService:
 
         await self.db.flush()
 
-        # 记录操作日志
-        operation_log = OperationLog(
+        # 记录操作日志（操作类型与内容均走 i18n，读时按请求语言翻译）
+        await write_log(
+            self.db,
             user_id=user_id,
             user_name=user_name,
-            operation_type="RESET",
-            operation_object="UserDashboardConfig",
-            operation_content="重置用户看板配置为默认值",
+            operation_type=OperationType.DASHBOARD_CONFIG_RESET,
+            operation_object_code="OBJ_USER_DASHBOARD_CONFIG",
+            operation_content_code="LOG_DASHBOARD_CONFIG_RESET",
             previous_value=json.dumps(previous_value, ensure_ascii=False),
             updated_value=json.dumps({
                 "module_config": config.module_config,
@@ -325,8 +346,6 @@ class DashboardConfigService:
             }, ensure_ascii=False),
             result="success",
         )
-        self.db.add(operation_log)
-        await self.db.flush()
 
         return UserDashboardConfigResponse.model_validate(config)
 
@@ -357,7 +376,7 @@ class DashboardStatService:
 
         base_query = select(Content).where(
             Content.status == "Published",
-            Content.content_type.in_(["MOVIE", "SEASON", "SERIES"]),
+            Content.content_type.in_(["MOVIE", "SEASON", "SEASON_SERIES", "SERIES"]),
             Content.is_deleted.is_(False),
             Content.is_discarded.is_(False),
             Content.is_archived.is_(False),
@@ -370,7 +389,7 @@ class DashboardStatService:
             .join(Content, LicenseContent.content_id == Content.id)
             .where(
                 Content.status == "Published",
-                Content.content_type.in_(["MOVIE", "SEASON", "SERIES"]),
+                Content.content_type.in_(["MOVIE", "SEASON", "SEASON_SERIES", "SERIES"]),
                 Content.is_deleted.is_(False),
                 Content.is_discarded.is_(False),
                 Content.is_archived.is_(False),
@@ -396,7 +415,7 @@ class DashboardStatService:
             select(Content.content_type, func.count(Content.id))
             .where(
                 Content.status == "Published",
-                Content.content_type.in_(["MOVIE", "SEASON", "SERIES"]),
+                Content.content_type.in_(["MOVIE", "SEASON", "SEASON_SERIES", "SERIES"]),
                 Content.is_deleted.is_(False),
                 Content.is_discarded.is_(False),
                 Content.is_archived.is_(False),
@@ -410,18 +429,21 @@ class DashboardStatService:
         by_content_type = [
             PieDataItem(name="Movie", value=content_type_counts.get("MOVIE", 0)),
             PieDataItem(name="Series", value=content_type_counts.get("SERIES", 0)),
+            PieDataItem(name="Season Series", value=content_type_counts.get("SEASON_SERIES", 0)),
             PieDataItem(name="Season", value=content_type_counts.get("SEASON", 0)),
         ]
 
         genre_query = (
             select(Genre.name, func.count(Content.id))
-            .join(Content, Content.genre_id == Genre.id)
+            .join(ContentGenre, ContentGenre.genre_id == Genre.id)
+            .join(Content, Content.id == ContentGenre.content_id)
             .where(
                 Content.status == "Published",
-                Content.content_type.in_(["MOVIE", "SEASON", "SERIES"]),
+                Content.content_type.in_(["MOVIE", "SEASON", "SEASON_SERIES", "SERIES"]),
                 Content.is_deleted.is_(False),
                 Content.is_discarded.is_(False),
                 Content.is_archived.is_(False),
+                ContentGenre.is_deleted.is_(False),
                 Genre.is_deleted.is_(False),
             )
         )
@@ -445,7 +467,7 @@ class DashboardStatService:
         ingest_status_query = (
             select(Content.status, func.count(Content.id))
             .where(
-                Content.content_type.in_(["MOVIE", "SEASON", "SERIES"]),
+                Content.content_type.in_(["MOVIE", "SEASON", "SEASON_SERIES", "SERIES"]),
                 Content.is_deleted.is_(False),
                 Content.is_discarded.is_(False),
                 Content.is_archived.is_(False),
@@ -457,12 +479,10 @@ class DashboardStatService:
         result = await self.db.execute(ingest_status_query)
         ingest_status_counts = {row[0]: row[1] for row in result.all()}
 
-        ingest_status_filter = ["InProgress", "ReadyForPublish", "Published", "NoActiveLicense", "Closed"]
         ingest_status_items = await get_dict_children_by_code(self.db, "Ingest_Status")
         by_ingest_status = [
             PieDataItem(name=item.name, value=ingest_status_counts.get(item.code, 0))
             for item in ingest_status_items
-            if item.code in ingest_status_filter
         ]
 
         return PublishedStatsResponse(
@@ -477,11 +497,17 @@ class DashboardStatService:
     # ───────────────────────────────────────────────────────
 
     async def get_content_status_count(self, current_user: User | None = None) -> ContentStatusCountResponse:
-        """获取内容状态统计"""
+        """获取内容状态统计（Ingest_Status 字典状态 + Near-Expired/Deleted 计算状态）
+
+        计算状态口径（与点击跳转 VOD 列表后的过滤口径严格一致，保证统计数 = 列表条数）：
+            near_expired：状态为 Published，且存在许可证 end_date 在 [today, today+N]（闭区间）内
+            deleted：is_discarded=true（与 VOD 列表 Deleted=YES 筛选一致）
+        其中 N 为每次调用时读取的 NEAR_EXPIRY_DAYS 配置值（默认 7），并随响应返回供前端跳转复用
+        """
         status_query = (
             select(Content.status, func.count(Content.id))
             .where(
-                Content.content_type.in_(["MOVIE", "SEASON", "SERIES"]),
+                Content.content_type.in_(["MOVIE", "SEASON", "SEASON_SERIES", "SERIES"]),
                 Content.is_deleted.is_(False),
                 Content.is_discarded.is_(False),
                 Content.is_archived.is_(False),
@@ -493,18 +519,49 @@ class DashboardStatService:
         result = await self.db.execute(status_query)
         status_counts = {row[0]: row[1] for row in result.all()}
 
+        # 临近过期统计：Published + 任一许可证 end_date 在 [today, today+N]（闭区间）
         near_expiry_days = await get_config_int(self.db, "NEAR_EXPIRY_DAYS", 7)
-        near_expiry_count = await self._count_near_expiry_contents(near_expiry_days, current_user)
-
-        # 统计已删除内容数量（is_deleted=True 且 content_type 为 MOVIE/SEASON/SERIES）
-        deleted_result = await self.db.execute(
-            select(func.count(Content.id))
+        today = date.today()
+        threshold = today + timedelta(days=near_expiry_days)
+        near_lic_content_ids = (
+            select(LicenseContent.content_id)
+            .join(License, License.id == LicenseContent.license_id)
             .where(
-                Content.content_type.in_(["MOVIE", "SEASON", "SERIES"]),
-                Content.is_deleted.is_(True),
+                LicenseContent.is_deleted.is_(False),
+                License.is_deleted.is_(False),
+                License.end_date.is_not(None),
+                License.end_date >= today,
+                License.end_date <= threshold,
             )
         )
-        deleted_count = deleted_result.scalar() or 0
+        near_expired_query = (
+            select(func.count(Content.id))
+            .where(
+                Content.content_type.in_(["MOVIE", "SEASON", "SEASON_SERIES", "SERIES"]),
+                Content.status == "Published",
+                Content.is_deleted.is_(False),
+                Content.is_discarded.is_(False),
+                Content.is_archived.is_(False),
+                Content.id.in_(near_lic_content_ids),
+            )
+        )
+        if current_user is not None:
+            near_expired_query = await apply_content_data_auth(self.db, current_user, near_expired_query)
+        near_expired_count = (await self.db.execute(near_expired_query)).scalar() or 0
+
+        # 已删除统计：is_discarded=true（与 VOD 列表 Deleted=YES 筛选口径一致）
+        deleted_query = (
+            select(func.count(Content.id))
+            .where(
+                Content.content_type.in_(["MOVIE", "SEASON", "SEASON_SERIES", "SERIES"]),
+                Content.is_deleted.is_(False),
+                Content.is_discarded.is_(True),
+                Content.is_archived.is_(False),
+            )
+        )
+        if current_user is not None:
+            deleted_query = await apply_content_data_auth(self.db, current_user, deleted_query)
+        deleted_count = (await self.db.execute(deleted_query)).scalar() or 0
 
         return ContentStatusCountResponse(
             waiting_for_materials=status_counts.get("WaitingForMaterials", 0),
@@ -514,73 +571,12 @@ class DashboardStatService:
             published=status_counts.get("Published", 0),
             publish_failed=status_counts.get("PublishFailed", 0),
             no_active_license=status_counts.get("NoActiveLicense", 0),
-            expired=status_counts.get("Expired", 0),
-            near_expiry=near_expiry_count,
-            near_expiry_days=near_expiry_days,
-            deleted=deleted_count,
             closed=status_counts.get("Closed", 0),
             none_status=status_counts.get("None", 0),
+            near_expired=near_expired_count,
+            near_expiry_days=near_expiry_days,
+            deleted=deleted_count,
         )
-
-    async def _count_near_expiry_contents(self, near_expiry_days: int, current_user: User | None = None) -> int:
-        """
-        统计临近过期内容数量。
-
-        判定条件：
-        1. 内容状态为 Published
-        2. 内容关联的许可证中，至少存在一条 end_date 在 [today, today + near_expiry_days) 范围内
-        3. 内容关联的许可证中，不存在任何 end_date IS NULL OR end_date >= today + near_expiry_days 的有效许可证
-        即：所有许可证都将在 near_expiry_days 天内到期，但尚未过期
-        """
-        if near_expiry_days <= 0:
-            return 0
-
-        today = date.today()
-        threshold = today + timedelta(days=near_expiry_days)
-
-        has_near_expiry_subq = (
-            select(LicenseContent.content_id)
-            .join(License, License.id == LicenseContent.license_id)
-            .where(
-                LicenseContent.is_deleted.is_(False),
-                License.is_deleted.is_(False),
-                License.end_date.is_not(None),
-                License.end_date >= today,
-                License.end_date < threshold,
-            )
-            .distinct()
-        )
-
-        has_long_valid_subq = (
-            select(LicenseContent.content_id)
-            .join(License, License.id == LicenseContent.license_id)
-            .where(
-                LicenseContent.is_deleted.is_(False),
-                License.is_deleted.is_(False),
-                or_(
-                    License.end_date.is_(None),
-                    License.end_date >= threshold,
-                ),
-            )
-            .distinct()
-        )
-
-        near_expiry_query = (
-            select(func.count(Content.id))
-            .where(
-                Content.is_deleted.is_(False),
-                Content.is_discarded.is_(False),
-                Content.is_archived.is_(False),
-                Content.content_type.in_(["MOVIE", "SEASON", "SERIES"]),
-                Content.status == "Published",
-                Content.id.in_(has_near_expiry_subq),
-                Content.id.notin_(has_long_valid_subq),
-            )
-        )
-        if current_user is not None:
-            near_expiry_query = await apply_content_data_auth(self.db, current_user, near_expiry_query)
-        result = await self.db.execute(near_expiry_query)
-        return result.scalar() or 0
 
     # ───────────────────────────────────────────────────────
     # 3.3 题材x状态矩阵
@@ -592,43 +588,68 @@ class DashboardStatService:
         """获取题材x状态矩阵
 
         Args:
-            visible_genres: 用户配置中可见的题材名称列表，为None时返回所有题材
-            visible_statuses: 用户配置中可见的状态代码列表，为None时返回所有状态
+            visible_genres: 用户配置中可见的题材名称列表；None 表示不过滤（全部题材），空列表表示过滤为空集
+            visible_statuses: 用户配置中可见的状态代码列表；None 表示不过滤（全部字典状态），空列表表示过滤为空集
             current_user: 当前用户，用于数据权限过滤
         """
+        # 题材口径与配置同步（_sync_genre_config）一致：按默认语言过滤并去重，避免多语言同名题材重复展示
+        default_language = await DashboardConfigService(self.db)._get_default_language()
+
         genre_query = select(Genre.name).where(Genre.is_deleted.is_(False))
-        if visible_genres:
+        if default_language:
+            genre_query = genre_query.where(Genre.language == default_language)
+        if visible_genres is not None:
             genre_query = genre_query.where(Genre.name.in_(visible_genres))
         genre_query = genre_query.order_by(Genre.id)
 
         genre_result = await self.db.execute(genre_query)
-        genres = [row[0] for row in genre_result.all()]
+        # 保序去重（防御 default_language 为空时的同名多语言记录）
+        existing_genres: list[str] = []
+        seen_genres: set[str] = set()
+        for row in genre_result.all():
+            if row[0] not in seen_genres:
+                seen_genres.add(row[0])
+                existing_genres.append(row[0])
 
-        if visible_statuses:
-            statuses = visible_statuses
+        # 题材输出顺序遵循用户配置顺序（visible_genres 已按 sort_order 排序）
+        if visible_genres is not None:
+            genres = [g for g in visible_genres if g in seen_genres]
         else:
-            statuses = [
-                "WaitingForMaterials", "InProgress", "ReadyForPublish", "Publishing",
-                "Published", "PublishFailed", "NoActiveLicense", "Expired", "Closed", "None"
-            ]
+            genres = existing_genres
+
+        # 状态白名单：Ingest_Status 字典状态 + 计算状态 Deleted（按题材统计真实已删除数量）
+        # NearExpired 仅由 ContentStatusCount 模块计算（涉及许可证日期窗口，矩阵不展示）
+        dict_status_items = await get_dict_children_by_code(self.db, "Ingest_Status")
+        dict_status_codes = {item.code for item in dict_status_items}
+        allowed_codes = dict_status_codes | {"Deleted"}
+        if visible_statuses is not None:
+            statuses = [s for s in visible_statuses if s in allowed_codes]
+        else:
+            statuses = [item.code for item in dict_status_items] + ["Deleted"]
 
         matrix_query = (
-            select(Genre.name, Content.status, func.count(Content.id))
-            .join(Content, Content.genre_id == Genre.id)
+            select(Genre.name, Content.status, func.count(Content.id.distinct()))
+            .join(ContentGenre, ContentGenre.genre_id == Genre.id)
+            .join(Content, Content.id == ContentGenre.content_id)
             .where(
-                Content.content_type.in_(["MOVIE", "SEASON", "SERIES"]),
+                Content.content_type.in_(["MOVIE", "SEASON", "SEASON_SERIES", "SERIES"]),
                 Content.is_deleted.is_(False),
                 Content.is_discarded.is_(False),
                 Content.is_archived.is_(False),
+                ContentGenre.is_deleted.is_(False),
                 Genre.is_deleted.is_(False),
             )
         )
+        if default_language:
+            matrix_query = matrix_query.where(Genre.language == default_language)
         if current_user is not None:
             matrix_query = await apply_content_data_auth(self.db, current_user, matrix_query)
-        if visible_genres:
+        if visible_genres is not None:
             matrix_query = matrix_query.where(Genre.name.in_(visible_genres))
-        if visible_statuses:
-            matrix_query = matrix_query.where(Content.status.in_(visible_statuses))
+        if visible_statuses is not None:
+            # 常规支仅按字典状态过滤（Deleted 由独立分支统计，不混入 Content.status 条件）
+            dict_visible = [s for s in visible_statuses if s in dict_status_codes]
+            matrix_query = matrix_query.where(Content.status.in_(dict_visible or [""]))
         matrix_query = matrix_query.group_by(Genre.name, Content.status)
 
         result = await self.db.execute(matrix_query)
@@ -638,6 +659,34 @@ class DashboardStatService:
             genre_name, status, count = row
             if genre_name in data and status in data[genre_name]:
                 data[genre_name][status] = count
+
+        # Deleted 计算分支：与常规支同口径，但按 is_discarded=true 统计（与 VOD 列表 Deleted=YES 筛选一致）
+        if "Deleted" in statuses:
+            deleted_query = (
+                select(Genre.name, func.count(Content.id.distinct()))
+                .join(ContentGenre, ContentGenre.genre_id == Genre.id)
+                .join(Content, Content.id == ContentGenre.content_id)
+                .where(
+                    Content.content_type.in_(["MOVIE", "SEASON", "SEASON_SERIES", "SERIES"]),
+                    Content.is_deleted.is_(False),
+                    Content.is_discarded.is_(True),
+                    Content.is_archived.is_(False),
+                    ContentGenre.is_deleted.is_(False),
+                    Genre.is_deleted.is_(False),
+                )
+            )
+            if default_language:
+                deleted_query = deleted_query.where(Genre.language == default_language)
+            if current_user is not None:
+                deleted_query = await apply_content_data_auth(self.db, current_user, deleted_query)
+            if visible_genres is not None:
+                deleted_query = deleted_query.where(Genre.name.in_(visible_genres))
+            deleted_query = deleted_query.group_by(Genre.name)
+
+            deleted_result = await self.db.execute(deleted_query)
+            for genre_name, count in deleted_result.all():
+                if genre_name in data:
+                    data[genre_name]["Deleted"] = count
 
         return GenreStatusMatrixResponse(
             genres=genres,
@@ -768,7 +817,8 @@ class DashboardStatService:
             )
 
             total = arrangement_pending + review_l1_pending + review_l2_pending + review_l3_pending + arrangement_completed + review_completed
-            completion_rate = (review_completed / total * 100) if total > 0 else 0
+            # 完成率 = 完成任务数 / 总任务数（总任务数 = 待处理数 + 已完成数），分子含全部已完成任务
+            completion_rate = ((arrangement_completed + review_completed) / total * 100) if total > 0 else 0
 
             data.append(
                 TaskAssignedMatrixItem(
@@ -795,19 +845,28 @@ class DashboardStatService:
         config_service = DashboardConfigService(self.db)
         config = await config_service.get_or_create_config(user_id)
 
+        # 可见题材/状态按用户 sort_order 排序输出，供矩阵等模块保持用户配置顺序
         visible_genres = [
-            item.get("name") for item in config.content_genre_config
-            if item.get("visible") and item.get("name")
+            item.get("name")
+            for item in sorted(
+                (i for i in config.content_genre_config if i.get("visible")),
+                key=lambda i: i.get("sort_order", 0),
+            )
+            if item.get("name")
         ]
         visible_statuses = [
-            item.get("code") for item in config.content_status_config
-            if item.get("visible") and item.get("code")
+            item.get("code")
+            for item in sorted(
+                (i for i in config.content_status_config if i.get("visible")),
+                key=lambda i: i.get("sort_order", 0),
+            )
+            if item.get("code")
         ]
         logger.info(f"get_dashboard_data 用户 {user_id} 的可见题材: {visible_genres}")
         logger.info(f"get_dashboard_data 用户 {user_id} 的可见状态: {visible_statuses}")
         logger.info(f"get_dashboard_data 用户配置: {config.content_genre_config}")
 
-        can_see_task = current_user is not None and await has_task_assign_role(self.db, current_user)
+        can_see_task = current_user is not None and await has_task_permission(self.db, current_user)
 
         task_completion_stats = await self.get_task_completion_stats() if can_see_task else TaskCompletionStatsResponse(
             arrangement=[], review_l1=[], review_l2=[], review_l3=[],
@@ -826,4 +885,5 @@ class DashboardStatService:
             task_completion_stats=task_completion_stats,
             task_status_count=task_status_count,
             task_assigned_matrix=task_assigned_matrix,
+            can_see_task_modules=can_see_task,
         )

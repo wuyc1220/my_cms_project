@@ -2,6 +2,8 @@
 系统管理模块 - 数据访问层（补充）
 Config / Dict / OperationLog / SensitiveWord / UsageLimit 的 SQLAlchemy 操作
 """
+from datetime import datetime
+
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -107,9 +109,9 @@ async def list_operation_logs_query(
     if operation_type:
         query = query.where(OperationLog.operation_type == operation_type)
     if start_date:
-        query = query.where(OperationLog.created_at >= start_date)
+        query = query.where(OperationLog.created_at >= datetime.fromisoformat(start_date))
     if end_date:
-        query = query.where(OperationLog.created_at <= end_date)
+        query = query.where(OperationLog.created_at <= datetime.fromisoformat(end_date))
 
     total = (await db.execute(select(func.count()).select_from(query.subquery()))).scalar_one()
     result = await db.execute(

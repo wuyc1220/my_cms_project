@@ -77,8 +77,8 @@ async def create_dict_node(
         user_id=current_user.id,
         user_name=current_user.username,
         operation_type=OperationType.DICT_CREATE,
-        operation_object=f"字典节点 {node.name}",
-        operation_content=f"Created dict item: name={node.name}, code={node.code}",
+        operation_object_code="OBJ_DICT_NODE", operation_object_params={"name": node.name},
+        operation_content_code="LOG_DICT_CREATE", operation_content_params={"name": node.name},
         ip_address=_get_ip(request),
         result="success",
         previous_value=prev_val,
@@ -109,8 +109,8 @@ async def update_dict_node(
         user_id=current_user.id,
         user_name=current_user.username,
         operation_type=OperationType.DICT_EDIT,
-        operation_object=f"字典节点 {node.name}",
-        operation_content=f"Updated dict item: ID={node_id}, name={node.name}",
+        operation_object_code="OBJ_DICT_NODE", operation_object_params={"name": node.name},
+        operation_content_code="LOG_DICT_EDIT", operation_content_params={"name": node.name},
         ip_address=_get_ip(request),
         result="success",
         previous_value=prev_val,
@@ -135,15 +135,15 @@ async def update_dict_node_status(
     old_data = orm_to_dict(old_node)
     node = await toggle_status(db, node_id, body["status"])
     new_data = orm_to_dict(node)
-    new_status_label = "enabled" if body["status"] == "active" else "disabled"
     prev_val, new_val, raw_val = await prepare_log_values(db, "dict_node", old_data, new_data)
     await write_log(
         db,
         user_id=current_user.id,
         user_name=current_user.username,
         operation_type=OperationType.DICT_STATUS,
-        operation_object=f"字典节点 {node.name}",
-        operation_content=f"Changed dict item status: name={node.name}, new status={new_status_label}",
+        operation_object_code="OBJ_DICT_NODE", operation_object_params={"name": node.name},
+        operation_content_code="LOG_DICT_STATUS_ENABLED" if body["status"] == "active" else "LOG_DICT_STATUS_DISABLED",
+        operation_content_params={"name": node.name},
         ip_address=_get_ip(request),
         result="success",
         previous_value=prev_val,
@@ -173,8 +173,8 @@ async def delete_dict_node(
         user_id=current_user.id,
         user_name=current_user.username,
         operation_type=OperationType.DICT_DELETE,
-        operation_object=f"字典节点 {node_name}",
-        operation_content=f"Deleted dict item: ID={node_id}, name={node_name}",
+        operation_object_code="OBJ_DICT_NODE", operation_object_params={"name": node_name},
+        operation_content_code="LOG_DICT_DELETE", operation_content_params={"name": node_name},
         ip_address=_get_ip(request),
         result="success",
         previous_value=prev_val,

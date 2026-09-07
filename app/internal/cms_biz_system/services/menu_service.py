@@ -73,7 +73,6 @@ async def get_user_menu_tree(db: AsyncSession, user_id: int, role_codes: list[st
 
     规则：
     - admin 角色拥有所有菜单和权限点
-    - Dashboard (id=1) 对所有用户可见
     - 其他菜单根据 role_menu 关联过滤
     - 如果父菜单下无可见子菜单，则自动隐藏父菜单
     - 返回导航菜单（menu_type=menu）和权限点（menu_type=permission），
@@ -99,11 +98,6 @@ async def get_user_menu_tree(db: AsyncSession, user_id: int, role_codes: list[st
     for perm in perm_items:
         if perm.parent_id is not None:
             visible_ids.add(perm.parent_id)
-
-    # Dashboard 对所有用户可见
-    dashboard = next((m for m in non_admin_flat if m.id == 1), None)
-    if dashboard:
-        visible_ids.add(dashboard.id)
 
     # 过滤可见的菜单和权限点
     visible_flat = [m for m in non_admin_flat if m.id in visible_ids]
@@ -192,7 +186,7 @@ async def assign_role_menus(db: AsyncSession, role_id: int, menu_ids: list[int])
         valid_ids = {m.id for m in valid_menus}
         invalid_ids = set(menu_ids) - valid_ids
         if invalid_ids:
-            raise BusinessException(ErrorCode.VALIDATION_ERROR, f"Invalid menu IDs: {invalid_ids}")
+            raise BusinessException(ErrorCode.VALIDATION_ERROR, get_msg("INVALID_MENU_IDS", ids=invalid_ids))
 
     await replace_role_menus(db, role_id, menu_ids)
     await db.commit()

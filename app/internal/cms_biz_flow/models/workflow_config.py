@@ -21,7 +21,7 @@ class WorkflowConfig(Base):
         id                主键
         process_code      流程编码
         process_name      流程名称
-        belonging         所属模块: PROGRAM/SEASON/SERIES/CHANNEL/SCHEDULE
+        belonging         所属模块: MOVIE/EPISODE/SEASON/SEASON_SERIES/SERIES/CHANNEL/SCHEDULE
         status            状态: draft/published
         version           版本号
         published_version 已发布版本号
@@ -40,7 +40,7 @@ class WorkflowConfig(Base):
         String(200), nullable=False, comment="流程名称"
     )
     belonging: Mapped[str] = mapped_column(
-        String(50), nullable=False, index=True, comment="所属模块: PROGRAM/SEASON/SERIES/CHANNEL/SCHEDULE"
+        String(50), nullable=False, index=True, comment="所属模块: MOVIE/EPISODE/SEASON/SEASON_SERIES/SERIES/CHANNEL/SCHEDULE"
     )
     status: Mapped[str] = mapped_column(
         String(20), nullable=False, default="draft", server_default="draft",

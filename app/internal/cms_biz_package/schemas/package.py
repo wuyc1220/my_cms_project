@@ -102,3 +102,32 @@ class PackageContentAddRequest(BaseModel):
     """
 
     content_ids: list[int]
+
+
+# ─── Package Import/Export（导入导出）────────────────────────────────
+
+class PackageImportError(BaseModel):
+    """导入错误详情。"""
+    row: int
+    package_name: str
+    content_name: str
+    error_message: str
+
+
+class PackageImportResult(BaseModel):
+    """
+    服务包内容导入结果。
+
+    字段：
+        total       总处理行数
+        created     成功新增关联数
+        deleted     成功取消关联数
+        skipped     跳过数（未找到匹配或已存在）
+        errors      错误详情列表
+    """
+
+    total: int = 0
+    created: int = 0
+    deleted: int = 0
+    skipped: int = 0
+    errors: list[PackageImportError] = []

@@ -47,6 +47,13 @@ async def get_password_min_length(db: AsyncSession = Depends(get_db)):
     return {"value": min_length}
 
 
+@router.get("/public/password-pattern-min-len")
+async def get_password_pattern_min_len(db: AsyncSession = Depends(get_db)):
+    """获取密码模式阈值（重复/连续/键盘序列统一触发阈值，公开接口）"""
+    pattern_min_len = await get_config_int(db, "PASSWORD_PATTERN_MIN_LEN", 6)
+    return {"value": pattern_min_len}
+
+
 @router.get("/public/{key}")
 async def get_public_config(
     key: str,
@@ -98,8 +105,8 @@ async def create_config_api(
         user_id=current_user.id,
         user_name=current_user.username,
         operation_type=OperationType.CONFIG_CREATE,
-        operation_object=f"参数 {body.config_key}",
-        operation_content=f"Created config: name={body.config_name}, key={body.config_key}, value={body.config_value}",
+        operation_object_code="OBJ_CONFIG", operation_object_params={"name": body.config_key},
+        operation_content_code="LOG_CONFIG_CREATE", operation_content_params={"key": body.config_key},
         ip_address=_get_ip(request),
         result="success",
         previous_value=prev_val,
@@ -130,11 +137,9 @@ async def update_config_api(
         user_id=current_user.id,
         user_name=current_user.username,
         operation_type=OperationType.CONFIG_EDIT,
-        operation_object=f"参数 {config.config_key}",
-        operation_content=(
-            f"Updated config: key={config.config_key},"
-            f" old value={old_config.config_value}, new value={body.config_value}"
-        ),
+        operation_object_code="OBJ_CONFIG", operation_object_params={"name": config.config_key},
+        operation_content_code="LOG_CONFIG_EDIT",
+        operation_content_params={"key": config.config_key, "old_value": old_config.config_value, "new_value": body.config_value},
         ip_address=_get_ip(request),
         result="success",
         previous_value=prev_val,
@@ -164,8 +169,8 @@ async def delete_config_api(
         user_id=current_user.id,
         user_name=current_user.username,
         operation_type=OperationType.CONFIG_DELETE,
-        operation_object=f"参数 {config_key}",
-        operation_content=f"Deleted config: ID={config_id}, key={config_key}",
+        operation_object_code="OBJ_CONFIG", operation_object_params={"name": config_key},
+        operation_content_code="LOG_CONFIG_DELETE", operation_content_params={"key": config_key},
         ip_address=_get_ip(request),
         result="success",
         previous_value=prev_val,

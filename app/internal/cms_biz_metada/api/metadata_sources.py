@@ -68,8 +68,8 @@ async def create_metadata_source(
         user_id=current_user.id,
         user_name=current_user.username,
         operation_type=OperationType.METADATA_SOURCE_CREATE,
-        operation_object=f"数据源 {body.name}",
-        operation_content=f"Created metadata source: name={body.name}",
+        operation_object_code="OBJ_METADATA_SOURCE", operation_object_params={"name": body.name},
+        operation_content_code="LOG_METADATA_SOURCE_CREATE", operation_content_params={"name": body.name},
         ip_address=_get_ip(request),
         result="success",
         previous_value=prev_val,
@@ -101,8 +101,8 @@ async def update_metadata_source(
         user_id=current_user.id,
         user_name=current_user.username,
         operation_type=OperationType.METADATA_SOURCE_EDIT,
-        operation_object=f"数据源 {old.name}",
-        operation_content=f"Updated metadata source: ID={source_id}",
+        operation_object_code="OBJ_METADATA_SOURCE", operation_object_params={"name": old.name},
+        operation_content_code="LOG_METADATA_SOURCE_EDIT", operation_content_params={"name": old.name},
         ip_address=_get_ip(request),
         result="success",
         previous_value=prev_val,
@@ -134,8 +134,8 @@ async def toggle_metadata_source_status(
         user_id=current_user.id,
         user_name=current_user.username,
         operation_type=OperationType.METADATA_SOURCE_STATUS,
-        operation_object=f"数据源 {source.name}",
-        operation_content=f"Status changed to {body.status}",
+        operation_object_code="OBJ_METADATA_SOURCE", operation_object_params={"name": source.name},
+        operation_content_code="LOG_METADATA_SOURCE_STATUS_ENABLED" if body.status == "YES" else "LOG_METADATA_SOURCE_STATUS_DISABLED",
         ip_address=_get_ip(request),
         result="success",
         previous_value=prev_val,
@@ -156,20 +156,26 @@ async def batch_enable_sources(
     current_user: User = Depends(get_current_user),
 ):
     """批量启用数据源"""
-    rows = (await db.execute(select(MetadataSource.name).where(MetadataSource.id.in_(body.ids)))).scalars().all()
-    src_names = ", ".join(rows) if rows else str(body.ids)
+    sources = (await db.execute(select(MetadataSource).where(MetadataSource.id.in_(body.ids), MetadataSource.is_deleted.is_(False)))).scalars().all()
+    src_names = ", ".join([s.name for s in sources]) if sources else str(body.ids)
+    old_data = [orm_to_dict(s) for s in sources]
     count = await batch_set_status(db, body.ids, "YES")
+    new_data = [orm_to_dict(s) for s in sources if s.status == "YES"]
+    prev_val, new_val, raw_val = await prepare_log_values(db, "metadata_source", old_data, new_data)
     await write_log(
         db,
         user_id=current_user.id,
         user_name=current_user.username,
         operation_type=OperationType.METADATA_SOURCE_BATCH_ENABLE,
-        operation_object=f"数据源 {src_names}",
-        operation_content=f"批量启用数据源: {src_names}",
+        operation_object_code="OBJ_METADATA_SOURCE", operation_object_params={"name": src_names},
+        operation_content_code="LOG_METADATA_SOURCE_BATCH_ENABLE", operation_content_params={"names": src_names},
         ip_address=_get_ip(request),
         result="success",
         entity_type="metadata_source",
         entity_id=body.ids[0] if body.ids else None,
+        previous_value=prev_val,
+        updated_value=new_val,
+        updated_value_json=raw_val,
     )
     await db.commit()
     return {"success": True, "count": count}
@@ -183,20 +189,26 @@ async def batch_disable_sources(
     current_user: User = Depends(get_current_user),
 ):
     """批量禁用数据源"""
-    rows = (await db.execute(select(MetadataSource.name).where(MetadataSource.id.in_(body.ids)))).scalars().all()
-    src_names = ", ".join(rows) if rows else str(body.ids)
+    sources = (await db.execute(select(MetadataSource).where(MetadataSource.id.in_(body.ids), MetadataSource.is_deleted.is_(False)))).scalars().all()
+    src_names = ", ".join([s.name for s in sources]) if sources else str(body.ids)
+    old_data = [orm_to_dict(s) for s in sources]
     count = await batch_set_status(db, body.ids, "NO")
+    new_data = [orm_to_dict(s) for s in sources if s.status == "NO"]
+    prev_val, new_val, raw_val = await prepare_log_values(db, "metadata_source", old_data, new_data)
     await write_log(
         db,
         user_id=current_user.id,
         user_name=current_user.username,
         operation_type=OperationType.METADATA_SOURCE_BATCH_DISABLE,
-        operation_object=f"数据源 {src_names}",
-        operation_content=f"批量禁用数据源: {src_names}",
+        operation_object_code="OBJ_METADATA_SOURCE", operation_object_params={"name": src_names},
+        operation_content_code="LOG_METADATA_SOURCE_BATCH_DISABLE", operation_content_params={"names": src_names},
         ip_address=_get_ip(request),
         result="success",
         entity_type="metadata_source",
         entity_id=body.ids[0] if body.ids else None,
+        previous_value=prev_val,
+        updated_value=new_val,
+        updated_value_json=raw_val,
     )
     await db.commit()
     return {"success": True, "count": count}
@@ -210,20 +222,25 @@ async def batch_delete_sources(
     current_user: User = Depends(get_current_user),
 ):
     """批量逻辑删除数据源"""
-    rows = (await db.execute(select(MetadataSource.name).where(MetadataSource.id.in_(body.ids)))).scalars().all()
-    src_names = ", ".join(rows) if rows else str(body.ids)
+    sources = (await db.execute(select(MetadataSource).where(MetadataSource.id.in_(body.ids), MetadataSource.is_deleted.is_(False)))).scalars().all()
+    src_names = ", ".join([s.name for s in sources]) if sources else str(body.ids)
+    prev_data = [orm_to_dict(s) for s in sources]
+    prev_val, _, raw_val = await prepare_log_values(db, "metadata_source", prev_data, None)
     count = await batch_delete(db, body.ids)
     await write_log(
         db,
         user_id=current_user.id,
         user_name=current_user.username,
         operation_type=OperationType.METADATA_SOURCE_BATCH_DELETE,
-        operation_object=f"数据源 {src_names}",
-        operation_content=f"批量删除数据源: {src_names}",
+        operation_object_code="OBJ_METADATA_SOURCE", operation_object_params={"name": src_names},
+        operation_content_code="LOG_METADATA_SOURCE_BATCH_DELETE", operation_content_params={"names": src_names},
         ip_address=_get_ip(request),
         result="success",
         entity_type="metadata_source",
         entity_id=body.ids[0] if body.ids else None,
+        previous_value=prev_val,
+        updated_value=None,
+        updated_value_json=raw_val,
     )
     await db.commit()
     return {"success": True, "count": count}
@@ -247,8 +264,8 @@ async def delete_metadata_source(
         user_id=current_user.id,
         user_name=current_user.username,
         operation_type=OperationType.METADATA_SOURCE_DELETE,
-        operation_object=f"数据源 {source_name}",
-        operation_content=f"Deleted metadata source: ID={source_id}",
+        operation_object_code="OBJ_METADATA_SOURCE", operation_object_params={"name": source_name},
+        operation_content_code="LOG_METADATA_SOURCE_DELETE", operation_content_params={"name": source_name},
         ip_address=_get_ip(request),
         result="success",
         previous_value=prev_val,

@@ -166,16 +166,32 @@ async def list_contracts(
     if end_date_to:
         query = query.where(Contract.end_date <= date_type.fromisoformat(end_date_to))
     if without_license:
-        # 使用 NOT EXISTS 替代 NOT IN，避免子查询返回 NULL 时的问题
         sub_license_exists = select(License).where(
             License.contract_id == Contract.id,
             License.is_deleted.is_(False),
         )
         query = query.where(~sub_license_exists.exists())
 
-    # 动态排序
     if sort_by and sort_order:
-        sort_column = getattr(Contract, sort_by, None)
+        if sort_by == "provider_name":
+            from ..models.trade import Provider
+            query = query.outerjoin(Provider, Provider.id == Contract.provider_id)
+            sort_column = Provider.name
+        elif sort_by == "license_count":
+            license_count_subq = (
+                select(func.count(License.id).label("license_count"))
+                .where(
+                    License.contract_id == Contract.id,
+                    License.is_deleted.is_(False),
+                )
+                .correlate(Contract)
+                .scalar_subquery()
+            )
+            query = query.add_columns(license_count_subq.label("license_count"))
+            sort_column = license_count_subq
+        else:
+            sort_column = getattr(Contract, sort_by, None)
+        
         if sort_column is not None:
             order_func = sort_column.asc() if sort_order == 'asc' else sort_column.desc()
             query = query.order_by(order_func, Contract.id.desc())
@@ -185,11 +201,18 @@ async def list_contracts(
         query = query.order_by(Contract.id.desc())
 
     total = (await db.execute(select(func.count()).select_from(query.subquery()))).scalar_one()
-    contracts = (
-        await db.execute(
+    if sort_by == "license_count":
+        result = await db.execute(
             query.offset((page - 1) * page_size).limit(page_size)
         )
-    ).scalars().all()
+        rows = result.all()
+        contracts = [row[0] for row in rows]
+    else:
+        contracts = (
+            await db.execute(
+                query.offset((page - 1) * page_size).limit(page_size)
+            )
+        ).scalars().all()
 
     items = [await _build_contract_item(db, c) for c in contracts]
     return PaginatedResponse(total=total, page=page, page_size=page_size, items=items)
@@ -421,32 +444,36 @@ async def get_contract_attachments(
 async def upload_attachment(
     db: AsyncSession,
     contract_id: int,
-    file_content: bytes,
+    file_path: str,
     file_name: str,
+    file_size: int,
     user_id: int | None,
+    relative_path: str | None = None,
 ) -> ContractAttachment:
     """
-    上传合同附件：将文件写入存储并在数据库中创建附件记录。
+    创建合同附件记录（文件已通过通用上传接口 /attachments/upload 上传）。
 
     输入参数：
         contract_id     合同 id
-        file_content    文件二进制内容
+        file_path       加密全路径（存储用）
         file_name       原始文件名
+        file_size       文件大小（字节）
         user_id         上传人 id（FK → cms_user.id）
+        relative_path   相对路径（下载用）
     输出：
         ContractAttachment ORM 对象
     业务规则：
         - 合同必须存在且未删除
-        - 文件存储路径格式：contracts/{contract_id}/{uuid}_{file_name}
+        - 文件已通过通用接口上传到 contracts 目录
     """
-    logger.info(f"upload_attachment 入参: contract_id={contract_id}, file_content={file_content}, file_name={file_name}, user_id={user_id}")
+    logger.info(f"upload_attachment 入参: contract_id={contract_id}, file_path={file_path}, file_name={file_name}, file_size={file_size}, user_id={user_id}, relative_path={relative_path}")
     await _get_contract_or_404(db, contract_id)
-    info = storage_service.save_file(file_content, file_name, f"contracts/{contract_id}")
     attachment = ContractAttachment(
         contract_id=contract_id,
-        file_name=info["file_name"],
-        file_path=info["file_path"],
-        file_size=info["file_size"],
+        file_name=file_name,
+        file_path=file_path,
+        relative_path=relative_path,
+        file_size=file_size,
         uploaded_by=user_id,
     )
     db.add(attachment)

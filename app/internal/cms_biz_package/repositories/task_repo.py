@@ -82,8 +82,9 @@ async def list_tasks_query(
         query = query.where(Task.assignee_id == assignee_id)
     elif assignee_keyword:
         query = query.where(
-            (User.display_name.ilike(f"%{assignee_keyword}%")) |
-            (User.username.ilike(f"%{assignee_keyword}%"))
+            (User.is_deleted.is_(False)) &
+            ((User.display_name.ilike(f"%{assignee_keyword}%")) |
+            (User.username.ilike(f"%{assignee_keyword}%")))
         )
     if content_name:
         query = query.where(Content.title.ilike(f"%{content_name}%"))
@@ -119,6 +120,7 @@ async def list_tasks_query(
             (Content.content_type == "MOVIE", 1),
             (Content.content_type == "SEASON", 2),
             (Content.content_type == "SERIES", 3),
+            (Content.content_type == "SEASON_SERIES", 3),
             (Content.content_type == "EPISODE", 4),
             (Content.content_type == "SCHEDULE", 5),
             else_=6,
@@ -143,6 +145,7 @@ async def list_tasks_query(
             (Content.content_type == "MOVIE", 1),
             (Content.content_type == "SEASON", 2),
             (Content.content_type == "SERIES", 3),
+            (Content.content_type == "SEASON_SERIES", 3),
             (Content.content_type == "EPISODE", 4),
             (Content.content_type == "SCHEDULE", 5),
             else_=6,
@@ -154,7 +157,15 @@ async def list_tasks_query(
             Task.id.desc(),
         )
     elif sort_by and sort_order:
-        sort_column = getattr(Task, sort_by, None)
+        if sort_by == "content_name":
+            sort_column = Content.title
+        elif sort_by == "content_type":
+            sort_column = Content.content_type
+        elif sort_by == "assignee_name":
+            sort_column = User.display_name
+        else:
+            sort_column = getattr(Task, sort_by, None)
+        
         if sort_column is not None:
             query = query.order_by(
                 sort_column.asc() if sort_order == "asc" else sort_column.desc(),
@@ -201,8 +212,9 @@ async def count_tasks(
         query = query.where(Task.assignee_id == assignee_id)
     elif assignee_keyword:
         query = query.where(
-            (User.display_name.ilike(f"%{assignee_keyword}%")) |
-            (User.username.ilike(f"%{assignee_keyword}%"))
+            (User.is_deleted.is_(False)) &
+            ((User.display_name.ilike(f"%{assignee_keyword}%")) |
+            (User.username.ilike(f"%{assignee_keyword}%")))
         )
     if content_name:
         query = query.where(Content.title.ilike(f"%{content_name}%"))

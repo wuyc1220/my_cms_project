@@ -81,6 +81,13 @@ class SensitiveCheckService:
                 return True
         return False
 
+    async def find_matches(self, db: AsyncSession, text: str) -> list[str]:
+        """返回文本命中的所有敏感词关键字（供元数据质量检查等需要定位命中词的场景使用）。"""
+        if not text:
+            return []
+        words = await self._load_active_words(db)
+        return [word.keyword for word in words if word.matches(text)]
+
     async def check_value(self, db: AsyncSession, value) -> bool:
         if isinstance(value, str) and value.strip():
             return await self.check_text(db, value)

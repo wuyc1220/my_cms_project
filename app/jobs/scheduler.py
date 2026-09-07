@@ -10,12 +10,15 @@
     * 执行前写一条 running 日志、更新 task.execution_status=running
     * 执行后回写 success/failed 日志、task.execution_status=idle、
       以及 last_execution_time / next_execution_time。
+- 多实例部署安全：使用 PostgreSQL advisory lock（pg_try_advisory_lock）
+  确保同一 task_type 在集群中只有一个实例执行，避免重复 SOAP 调用。
 
 cron 表达式格式（兼容 5 位标准与 6 位含秒扩展）：
     5 位：分 时 日 月 星期          例：`0 0 * * *`   → 每日 00:00
     6 位：秒 分 时 日 月 星期       例：`1 0 0 * * *` → 每日 00:00:01
 """
 
+import hashlib
 import time
 from datetime import datetime
 from typing import Awaitable, Callable
@@ -25,7 +28,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.date import DateTrigger
 from loguru import logger
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings, app_tz
@@ -60,6 +63,17 @@ _TASK_REGISTRY: dict[str, TaskFunc] = {
 }
 
 _LAZY_LOG_TASKS: set[str] = {"ContentPublish", "ContentScheduledOffline", "ContentArchive"}
+
+
+def _task_lock_id(task_type: str) -> int:
+    """
+    根据 task_type 生成确定性的 PostgreSQL advisory lock ID。
+
+    使用 MD5 前 16 位十六进制转整数并保留低 63 位，确保：
+    - 同一个 task_type 在所有 Python 进程/实例中产生相同的 lock ID
+    - 不同 task_type 之间互不阻塞（各自持有独立的锁）
+    """
+    return int(hashlib.md5(task_type.encode()).hexdigest()[:16], 16) & 0x7FFFFFFFFFFFFFFF
 
 
 _SCHEDULER_TZ = app_tz
@@ -226,134 +240,185 @@ async def _execute_task(task_type: str, trigger_type: str, operator: str | None 
         logger.error(f"[Scheduler] 未注册的任务类型：{task_type}")
         return
 
-    lazy_log = task_type in _LAZY_LOG_TASKS
-    start_ts = time.monotonic()
-    start_dt = datetime.now(_SCHEDULER_TZ)
-
-    # 1) 查询任务配置 + 标记运行状态
-    task_id: int | None = None
-    cron_expr: str | None = None
-    running_log_id: int | None = None
-    async with AsyncSessionLocal() as db:
-        task = (await db.execute(
-            select(ScheduledTask).where(ScheduledTask.task_type == task_type)
-        )).scalar_one_or_none()
-        if task is None:
-            logger.error(f"[Scheduler] 数据库中未找到任务：{task_type}")
-            return
-
-        task_id = task.id
-        cron_expr = task.cron_expression
-
-        if lazy_log:
-            task.execution_status = "running"
-            await db.commit()
-        else:
-            running_log = ScheduledTaskLog(
-                task_id=task.id,
-                execution_time=start_dt,
-                trigger_type=trigger_type,
-                execution_status="running",
-                duration=None,
-                result=None,
-            )
-            db.add(running_log)
-            task.execution_status = "running"
-            await db.commit()
-            await db.refresh(running_log)
-            running_log_id = running_log.id
-
-    # 2) 执行业务
-    status = "success"
-    result_summary: str | None = None
-    has_more = False
+    # 0) 获取 PostgreSQL advisory lock（多实例互斥，非阻塞）
+    lock_id = _task_lock_id(task_type)
+    lock_session = AsyncSessionLocal()
     try:
-        if trigger_type == "manual":
-            summary = await _execute_batch(func, task_type, check_id=check_id)
-        else:
-            async with AsyncSessionLocal() as db:
-                # MetadataQualityCheck 任务支持 check_id 参数
-                if task_type == "MetadataQualityCheck" and check_id is not None:
-                    summary = await func(db, check_id=check_id)
-                else:
-                    summary = await func(db)
+        result = await lock_session.execute(
+            text("SELECT pg_try_advisory_lock(:id)"), {"id": lock_id}
+        )
+        acquired = result.scalar()
+    except Exception as e:
+        logger.error(f"[Scheduler] 获取分布式锁异常 task_type={task_type}：{e}")
+        try:
+            await lock_session.close()
+        except Exception:
+            pass
+        return
 
-        if summary is None:
-            # 无待处理任务，但仍然需要更新执行时间
-            next_fire = _get_job_next_run_time(task_type)
+    if not acquired:
+        logger.info(f"[Scheduler] 任务 {task_type} 已被其他实例执行，跳过")
+        try:
+            await lock_session.close()
+        except Exception:
+            pass
+        return
+
+    try:
+        lazy_log = task_type in _LAZY_LOG_TASKS
+        start_ts = time.monotonic()
+        start_dt = datetime.now(_SCHEDULER_TZ)
+
+        # 1) 查询任务配置 + 标记运行状态
+        task_id: int | None = None
+        cron_expr: str | None = None
+        running_log_id: int | None = None
+        async with AsyncSessionLocal() as db:
+            task = (await db.execute(
+                select(ScheduledTask).where(
+                    ScheduledTask.task_type == task_type,
+                    ScheduledTask.is_deleted.is_(False)
+                )
+            )).scalar_one_or_none()
+            if task is None:
+                logger.error(f"[Scheduler] 数据库中未找到任务：{task_type}")
+                return
+
+            task_id = task.id
+            cron_expr = task.cron_expression
+
+            if lazy_log:
+                task.execution_status = "running"
+                await db.commit()
+            else:
+                running_log = ScheduledTaskLog(
+                    task_id=task.id,
+                    execution_time=start_dt,
+                    trigger_type=trigger_type,
+                    execution_status="running",
+                    duration=None,
+                    result=None,
+                )
+                db.add(running_log)
+                task.execution_status = "running"
+                await db.commit()
+                await db.refresh(running_log)
+                running_log_id = running_log.id
+
+        # 2) 执行业务
+        status = "success"
+        result_summary: str | None = None
+        has_more = False
+        try:
+            if trigger_type == "manual":
+                summary = await _execute_batch(func, task_type, check_id=check_id)
+            else:
+                async with AsyncSessionLocal() as db:
+                    # MetadataQualityCheck 任务支持 check_id 参数
+                    if task_type == "MetadataQualityCheck" and check_id is not None:
+                        summary = await func(db, check_id=check_id)
+                    else:
+                        summary = await func(db)
+
+            if summary is None:
+                # 无待处理任务，但仍然需要更新执行时间
+                next_fire = _get_job_next_run_time(task_type)
+                async with AsyncSessionLocal() as db:
+                    if not lazy_log and running_log_id is not None:
+                        log = await db.get(ScheduledTaskLog, running_log_id)
+                        if log is not None:
+                            await db.delete(log)
+                    task_row = await db.get(ScheduledTask, task_id)
+                    # 如果 APScheduler 没有返回下次执行时间，基于 cron 表达式计算
+                    if next_fire is None and task_row is not None:
+                        next_fire = _next_fire_time(task_row.cron_expression)
+                    if task_row is not None:
+                        task_row.execution_status = "idle"
+                        task_row.last_execution_time = start_dt
+                        task_row.next_execution_time = next_fire
+                    await db.commit()
+                if next_fire is not None:
+                    logger.info(f"[Scheduler] 任务 {task_type}({trigger_type}) 无待处理项，下次执行时间: {next_fire}")
+                else:
+                    logger.info(f"[Scheduler] 任务 {task_type}({trigger_type}) 无待处理项")
+                return
+
+            result_summary = str(summary)
+            has_more = isinstance(summary, dict) and summary.get("has_more", False)
+            logger.info(f"[Scheduler] 任务 {task_type}({trigger_type}) 执行完成：{result_summary}")
+        except Exception as exc:  # noqa: BLE001
+            status = "failed"
+            result_summary = f"{type(exc).__name__}: {exc}"
+            logger.exception(f"[Scheduler] 任务 {task_type}({trigger_type}) 执行异常")
+
+        # 3) 回写日志与任务状态（独立短事务）
+        duration = round(time.monotonic() - start_ts, 2)
+        
+        # 从 APScheduler 获取真实的下次触发时间
+        next_fire = _get_job_next_run_time(task_type)
+        # 如果 APScheduler 没有返回，基于 cron 表达式计算
+        if next_fire is None:
             async with AsyncSessionLocal() as db:
-                if not lazy_log and running_log_id is not None:
-                    log = await db.get(ScheduledTaskLog, running_log_id)
-                    if log is not None:
-                        await db.delete(log)
                 task_row = await db.get(ScheduledTask, task_id)
                 if task_row is not None:
-                    task_row.execution_status = "idle"
-                    task_row.last_execution_time = start_dt
-                    task_row.next_execution_time = next_fire
-                await db.commit()
-            if next_fire is not None:
-                logger.info(f"[Scheduler] 任务 {task_type}({trigger_type}) 无待处理项，下次执行时间: {next_fire}")
-            else:
-                logger.info(f"[Scheduler] 任务 {task_type}({trigger_type}) 无待处理项")
-            return
-
-        result_summary = str(summary)
-        has_more = isinstance(summary, dict) and summary.get("has_more", False)
-        logger.info(f"[Scheduler] 任务 {task_type}({trigger_type}) 执行完成：{result_summary}")
-    except Exception as exc:  # noqa: BLE001
-        status = "failed"
-        result_summary = f"{type(exc).__name__}: {exc}"
-        logger.exception(f"[Scheduler] 任务 {task_type}({trigger_type}) 执行异常")
-
-    # 3) 回写日志与任务状态（独立短事务）
-    duration = round(time.monotonic() - start_ts, 2)
-    
-    # 从 APScheduler 获取真实的下次触发时间，而不是重新计算
-    next_fire = _get_job_next_run_time(task_type)
-    if next_fire is not None:
-        logger.info(f"[Scheduler] 任务 {task_type} 下次执行时间: {next_fire}")
-    else:
-        logger.warning(f"[Scheduler] 任务 {task_type} 无法获取下次执行时间")
-
-    async with AsyncSessionLocal() as db:
-        if lazy_log:
-            log = ScheduledTaskLog(
-                task_id=task_id,
-                execution_time=start_dt,
-                trigger_type=trigger_type,
-                execution_status=status,
-                duration=duration,
-                result=(result_summary or "")[:2000],
-            )
-            db.add(log)
+                    next_fire = _next_fire_time(task_row.cron_expression)
+        
+        if next_fire is not None:
+            logger.info(f"[Scheduler] 任务 {task_type} 下次执行时间: {next_fire}")
         else:
-            log = await db.get(ScheduledTaskLog, running_log_id)
-            if log is not None:
-                log.execution_status = status
-                log.duration = duration
-                log.result = (result_summary or "")[:2000]
+            logger.warning(f"[Scheduler] 任务 {task_type} 无法获取下次执行时间")
 
-        task_row = await db.get(ScheduledTask, task_id)
-        if task_row is not None:
-            task_row.execution_status = "idle"
-            task_row.last_execution_time = start_dt
-            task_row.next_execution_time = next_fire
+        async with AsyncSessionLocal() as db:
+            if lazy_log:
+                log = ScheduledTaskLog(
+                    task_id=task_id,
+                    execution_time=start_dt,
+                    trigger_type=trigger_type,
+                    execution_status=status,
+                    duration=duration,
+                    result=(result_summary or "")[:2000],
+                )
+                db.add(log)
+            else:
+                log = await db.get(ScheduledTaskLog, running_log_id)
+                if log is not None:
+                    log.execution_status = status
+                    log.duration = duration
+                    log.result = (result_summary or "")[:2000]
 
-        await db.commit()
+            task_row = await db.get(ScheduledTask, task_id)
+            if task_row is not None:
+                task_row.execution_status = "idle"
+                task_row.last_execution_time = start_dt
+                task_row.next_execution_time = next_fire
 
-    # 4) 若仍有待处理任务，立即调度下一轮
-    if has_more and _scheduler is not None and _scheduler.running:
-        _scheduler.add_job(
-            _scheduled_wrapper,
-            trigger=DateTrigger(run_date=datetime.now(_SCHEDULER_TZ)),
-            args=[task_type],
-            id=f"continue-{task_type}-{int(time.time() * 1000)}",
-            name=f"continue-{task_type}",
-            replace_existing=False,
-            max_instances=1,
-        )
-        logger.info(f"[Scheduler] 任务 {task_type} 仍有待处理项，已调度立即执行")
+            await db.commit()
+
+        # 4) 若仍有待处理任务，立即调度下一轮
+        if has_more and _scheduler is not None and _scheduler.running:
+            _scheduler.add_job(
+                _scheduled_wrapper,
+                trigger=DateTrigger(run_date=datetime.now(_SCHEDULER_TZ)),
+                args=[task_type],
+                id=f"continue-{task_type}-{int(time.time() * 1000)}",
+                name=f"continue-{task_type}",
+                replace_existing=False,
+                max_instances=1,
+            )
+            logger.info(f"[Scheduler] 任务 {task_type} 仍有待处理项，已调度立即执行")
+
+    finally:
+        # 释放分布式锁（pg_advisory_unlock）
+        try:
+            await lock_session.execute(
+                text("SELECT pg_advisory_unlock(:id)"), {"id": lock_id}
+            )
+        except Exception:
+            pass
+        try:
+            await lock_session.close()
+        except Exception:
+            pass
 
 
 async def _scheduled_wrapper(task_type: str) -> None:
@@ -376,7 +441,10 @@ async def trigger_task_manual(db: AsyncSession, task_type: str, operator: str | 
         check_id: 可选，元数据质检记录ID。仅用于 MetadataQualityCheck 任务
     """
     task = (await db.execute(
-        select(ScheduledTask).where(ScheduledTask.task_type == task_type)
+        select(ScheduledTask).where(
+            ScheduledTask.task_type == task_type,
+            ScheduledTask.is_deleted.is_(False)
+        )
     )).scalar_one_or_none()
     if task is None:
         raise ValueError(f"任务不存在：{task_type}")
@@ -410,7 +478,10 @@ async def reload_task(task_type: str) -> None:
 
     async with AsyncSessionLocal() as db:
         task = (await db.execute(
-            select(ScheduledTask).where(ScheduledTask.task_type == task_type)
+            select(ScheduledTask).where(
+                ScheduledTask.task_type == task_type,
+                ScheduledTask.is_deleted.is_(False)
+            )
         )).scalar_one_or_none()
 
     # 先移除旧的（忽略不存在）
@@ -446,7 +517,21 @@ async def start_scheduler() -> None:
     """启动调度器并从 DB 注册所有启用状态的任务。"""
     global _scheduler
 
-    if not settings.scheduler_enabled:
+    # 优先从数据库读取配置，降级到 .env
+    from app.database import AsyncSessionLocal as async_session
+    from app.internal.cms_biz_system.services.config_service import get_config_bool
+    
+    scheduler_enabled = settings.scheduler_enabled  # .env 默认值
+    try:
+        async with async_session() as db:
+            db_enabled = await get_config_bool(db, "SCHEDULER_ENABLED", default_value=scheduler_enabled)
+            if db_enabled != scheduler_enabled:
+                logger.info(f"定时任务开关从数据库加载: {db_enabled} (覆盖.env: {scheduler_enabled})")
+                scheduler_enabled = db_enabled
+    except Exception as e:
+        logger.warning(f"从数据库加载 SCHEDULER_ENABLED 失败，使用 .env 默认值: {e}")
+
+    if not scheduler_enabled:
         logger.info("内置定时调度器未启用（SCHEDULER_ENABLED=false），跳过启动")
         return
 
@@ -459,7 +544,10 @@ async def start_scheduler() -> None:
 
     async with AsyncSessionLocal() as db:
         tasks = (await db.execute(
-            select(ScheduledTask).where(ScheduledTask.schedule_status == "enabled")
+            select(ScheduledTask).where(
+                ScheduledTask.schedule_status == "enabled",
+                ScheduledTask.is_deleted.is_(False)
+            )
         )).scalars().all()
 
     for task in tasks:
@@ -500,7 +588,10 @@ async def _sync_next_execution_times() -> None:
     async with AsyncSessionLocal() as db:
         for job in _scheduler.get_jobs():
             task = (await db.execute(
-                select(ScheduledTask).where(ScheduledTask.task_type == job.id)
+                select(ScheduledTask).where(
+                    ScheduledTask.task_type == job.id,
+                    ScheduledTask.is_deleted.is_(False)
+                )
             )).scalar_one_or_none()
             if task is not None and job.next_run_time is not None:
                 task.next_execution_time = job.next_run_time

@@ -6,7 +6,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.internal.cms_biz_metada.models.basic import Genre
-from app.internal.cms_biz_package.models.package import Content, ContentPackage, Package
+from app.internal.cms_biz_package.models.package import Content, ContentGenre, ContentPackage, Package
 from app.internal.cms_biz_scp.models.trade import License, LicenseContent, Provider
 from app.internal.cms_biz_package.models.package import PhysicalChannel
 
@@ -48,7 +48,8 @@ async def list_contents_query(
     if status:
         query = query.where(Content.status == status)
     if genre_id is not None:
-        query = query.where(Content.genre_id == genre_id)
+        subq = select(ContentGenre.content_id).where(ContentGenre.genre_id == genre_id, ContentGenre.is_deleted.is_(False))
+        query = query.where(Content.id.in_(subq))
     if is_archived is not None:
         query = query.where(Content.is_archived == is_archived)
 

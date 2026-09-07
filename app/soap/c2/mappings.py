@@ -3,9 +3,10 @@ C2 规范 Mapping 构建器。
 
 Mapping 表达"父对象 → 子对象"的从属关系，形如::
 
-    <Mapping ID="1" ParentType="Category" ParentID="1" ParentCode="1"
-             ElementType="Program" ElementID="123" ElementCode="123"
+    <Mapping ID="1" ParentType="Category" ParentID="Category_1" ParentCode="Category_1"
+             ElementType="Program" ElementID="Program_123" ElementCode="Program_123"
              Action="REGIST">
+        <Property Name="Type">1</Property>
         <Property Name="Sequence">1</Property>
     </Mapping>
 
@@ -13,10 +14,10 @@ Mapping 表达"父对象 → 子对象"的从属关系，形如::
     - ID (att)           唯一标识
     - Action (att)       REGIST/UPDATE/DELETE
     - ParentType (att)   父对象 ElementType
-    - ParentID (att)     父对象 ID
+    - ParentID (att)     父对象 ID（格式 ParentType_ID）
     - ParentCode (att)   同 ParentID
     - ElementType (att)  子对象 ElementType（非 ChildType）
-    - ElementID (att)    子对象 ID（非 ChildID）
+    - ElementID (att)    子对象 ID（格式 ElementType_ID）
     - ElementCode (att)  同 ElementID
 
 只允许 :data:`constants.VALID_MAPPINGS` 中定义的 15 种组合；
@@ -70,8 +71,8 @@ def build_mapping(
         return None
 
     mid = mapping_id or uuid4().hex[:16]
-    pid_str = str(parent_id)
-    eid_str = str(element_id)
+    pid_str = f"{parent_type.value}_{parent_id}"
+    eid_str = f"{element_type.value}_{element_id}"
 
     mapping_el = Element(
         "Mapping",

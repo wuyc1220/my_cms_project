@@ -21,6 +21,7 @@ from sqlalchemy import asc, desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.common.schemas import PaginatedResponse
+from app.config import app_tz
 from app.internal.cms_biz_system.models.metadata_quality import (
     MetadataQualityCheck,
     MetadataQualityIssue,
@@ -136,15 +137,30 @@ async def trigger_metadata_quality_check(
     """
     手动触发一次元数据质检。
 
-    当前为空壳实现：
-    - 立即写入一条 status=pending 记录（便于前端列表立刻出现新项）；
-    - 返回该记录 id；
-    - 后台异步把状态推进到 completed（由 scheduler.trigger_task_manual 走空壳业务逻辑
-      时会再插入一条 completed 记录，并不会回填这条 pending，故这里等价于简单的
-      占位：用户后续补真实逻辑时再整合）。
+    - 前置校验：任务不存在/未启用/正在执行时直接抛业务异常拒绝，
+      避免产生永远不会被推进的 pending 记录；
+    - 校验通过后写入一条 status=pending 记录（便于前端列表立刻出现新项）；
+    - 后台异步执行质检并把该记录推进到 completed/failed。
     """
+    # 前置校验：任务必须存在且启用，且当前不在执行中（复用定时任务的通用错误码）
+    task = (
+        await db.execute(
+            select(ScheduledTask).where(ScheduledTask.task_type == "MetadataQualityCheck")
+        )
+    ).scalar_one_or_none()
+    if task is None or task.schedule_status != "enabled":
+        raise BusinessException(
+            ErrorCode.SCHEDULED_TASK_DISABLED_BLOCKED,
+            get_msg("SCHEDULED_TASK_DISABLED_BLOCKED", task_types=["MetadataQualityCheck"]),
+        )
+    if task.execution_status == "running":
+        raise BusinessException(
+            ErrorCode.SCHEDULED_TASK_RUNNING_BLOCKED,
+            get_msg("SCHEDULED_TASK_RUNNING_BLOCKED", task_types=["MetadataQualityCheck"]),
+        )
+
     # 注意：模型里 created_by 是 int 外键（cms_user.id），而传入的 operator 是 username 字符串，
-    # 这里不回填 created_by，保持为 NULL；operator 仅用于后续 trigger_task_manual 的操作人标记。
+    # 这里不回填 created_by，保持为 NULL；operator 仅用于 trigger_task_manual 的操作人标记。
     record = MetadataQualityCheck(
         status="pending",
         total_contents=0,
@@ -158,19 +174,9 @@ async def trigger_metadata_quality_check(
     await db.refresh(record)
 
     # 触发后台任务，传入 check_id 以便更新 pending 记录
-    try:
-        from app.jobs.scheduler import trigger_task_manual
+    from app.jobs.scheduler import trigger_task_manual
 
-        task = (
-            await db.execute(
-                select(ScheduledTask).where(ScheduledTask.task_type == "MetadataQualityCheck")
-            )
-        ).scalar_one_or_none()
-        if task is not None and task.schedule_status == "enabled" and task.execution_status != "running":
-            await trigger_task_manual(db, "MetadataQualityCheck", operator=operator, check_id=record.id)
-    except Exception:  # noqa: BLE001
-        # 质检触发失败不影响 pending 记录的存在；前端仍能看到列表项
-        pass
+    await trigger_task_manual(db, "MetadataQualityCheck", operator=operator, check_id=record.id)
 
     return record.id
 
@@ -211,7 +217,7 @@ async def export_metadata_quality_report(db: AsyncSession, check_id: int) -> tup
     # Summary sheet
     summary_rows = [
         ("Check ID", detail.id),
-        ("Check Time", detail.check_time.strftime("%Y-%m-%d %H:%M:%S")),
+        ("Check Time", detail.check_time.astimezone(app_tz).strftime("%Y-%m-%d %H:%M:%S")),
         ("Status", detail.status),
         ("Total Contents", detail.total_contents),
         ("Passed", detail.passed_count),

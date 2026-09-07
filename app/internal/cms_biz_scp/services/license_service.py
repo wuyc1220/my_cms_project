@@ -14,15 +14,22 @@
 3. 软删除：is_deleted=True，不物理删除
 4. regions 存储为逗号分隔字符串，读写时转换为 list[str]
 5. 同一内容不能重复添加至同一许可证（唯一约束保证，重复时幂等跳过）
+6. 许可证层级继承：
+   - 总季（SEASON）添加许可证时，自动传播给其下所有单季（SEASON_SERIES）和单集（EPISODE）
+   - 单季（SEASON_SERIES）添加许可证时，自动传播给其下所有单集（EPISODE）
+   - 单集独立添加许可证不影响父级
+   - 总季/单季更换或解除许可证时，覆盖所有子节点的关联
 """
 
 from datetime import date as date_type
+import json
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.internal.cms_biz_metada.models.basic import Genre
-from app.internal.cms_biz_package.models.package import Content
+from app.internal.cms_biz_package.models.enums import ContentType
+from app.internal.cms_biz_package.models.package import Content, ContentGenre
 from ..models.trade import (
     Contract,
     License,
@@ -43,18 +50,25 @@ from app.common.schemas import BatchDeleteRequest, PaginatedResponse
 from loguru import logger
 from app.common.core.i18n import get_msg
 from app.common.core.exceptions import NotFoundException, BusinessException, ErrorCode
+from app.internal.cms_biz_system.services.data_auth_filter import apply_content_data_auth
+from app.internal.cms_biz_system.models.user import User
+from app.internal.cms_biz_system.services.operation_log_service import OperationType, write_log
 
 
 # ─── 内部辅助 ─────────────────────────────────────────────────────────
 
-async def _get_genre_name(db: AsyncSession, genre_id: int | None) -> str | None:
-    """根据 genre_id 查询题材名称，id 为空或不存在时返回 None。"""
-    if genre_id is None:
+async def _get_genre_names(db: AsyncSession, content_id: int) -> str | None:
+    """查询题材名称列表（逗号分隔），从中间表 content_genre 获取。"""
+    rows = (
+        await db.execute(
+            select(Genre.name)
+            .join(ContentGenre, ContentGenre.genre_id == Genre.id)
+            .where(ContentGenre.content_id == content_id, Genre.is_deleted.is_(False))
+        )
+    ).scalars().all()
+    if not rows:
         return None
-    genre = (
-        await db.execute(select(Genre).where(Genre.id == genre_id, Genre.is_deleted.is_(False)))
-    ).scalar_one_or_none()
-    return genre.name if genre else None
+    return ", ".join(rows)
 
 def _regions_to_list(regions: str | None) -> list[str]:
     """将存储的逗号分隔地区字符串转换为列表。"""
@@ -146,7 +160,7 @@ async def _check_name_unique(db: AsyncSession, name: str, exclude_id: int | None
         query = query.where(License.id != exclude_id)
     # 使用 limit(1) 避免数据库中存在多条同名记录时报错
     if (await db.execute(query.limit(1))).scalar_one_or_none():
-        raise BusinessException(ErrorCode.LICENSE_NAME_EXISTS, get_msg("LICENSE_NAME_EXISTS"))
+        raise BusinessException(ErrorCode.LICENSE_NAME_EXISTS, get_msg("LICENSE_NAME_EXISTS", name=name))
 
 
 async def _update_platforms(
@@ -167,6 +181,85 @@ async def _update_platforms(
             platform=p.platform,
             ad_rights=p.ad_rights,
         ))
+
+
+async def _get_season_descendant_ids(db: AsyncSession, season_id: int) -> list[int]:
+    """
+    获取 SEASON（总季）下所有子孙 content_id。
+
+    层级：SEASON → SEASON_SERIES（单季）→ EPISODE（单集）
+
+    返回所有 SEASON_SERIES 和 EPISODE 的 content_id 列表（扁平），
+    不含 SEASON 自身。
+    """
+    # 第一层：SEASON_SERIES
+    season_series_rows = (
+        await db.execute(
+            select(Content.id).where(
+                Content.parent_id == season_id,
+                Content.content_type == ContentType.SEASON_SERIES.value,
+                Content.is_deleted.is_(False),
+                Content.is_discarded.is_(False),
+            )
+        )
+    ).scalars().all()
+    season_series_ids = list(season_series_rows)
+
+    if not season_series_ids:
+        return []
+
+    # 第二层：EPISODE（单集）
+    episode_rows = (
+        await db.execute(
+            select(Content.id).where(
+                Content.parent_id.in_(season_series_ids),
+                Content.content_type == ContentType.EPISODE.value,
+                Content.is_deleted.is_(False),
+                Content.is_discarded.is_(False),
+            )
+        )
+    ).scalars().all()
+    episode_ids = list(episode_rows)
+
+    return season_series_ids + episode_ids
+
+
+async def _get_season_series_child_ids(db: AsyncSession, season_series_id: int) -> list[int]:
+    """
+    获取 SEASON_SERIES（单季）下的所有 EPISODE（单集）content_id。
+
+    不含 SEASON_SERIES 自身。
+    """
+    episode_rows = (
+        await db.execute(
+            select(Content.id).where(
+                Content.parent_id == season_series_id,
+                Content.content_type == ContentType.EPISODE.value,
+                Content.is_deleted.is_(False),
+                Content.is_discarded.is_(False),
+            )
+        )
+    ).scalars().all()
+    return list(episode_rows)
+
+
+async def _get_series_child_ids(db: AsyncSession, series_id: int) -> list[int]:
+    """
+    获取 SERIES（普通连续剧）下的所有 EPISODE（单集）content_id。
+
+    不含 SERIES 自身。
+    """
+    episode_rows = (
+        await db.execute(
+            select(Content.id).where(
+                Content.parent_id == series_id,
+                Content.content_type == ContentType.EPISODE.value,
+                Content.is_deleted.is_(False),
+                Content.is_discarded.is_(False),
+            )
+        )
+    ).scalars().all()
+    return list(episode_rows)
 
 
 # ─── License CRUD ─────────────────────────────────────────────────────
@@ -485,13 +578,14 @@ async def get_contract_licenses_simple(
 # ─── License↔Content 关联 ─────────────────────────────────────────────
 
 async def list_license_contents(
-    db: AsyncSession, license_id: int
+    db: AsyncSession, license_id: int, current_user: User | None = None
 ) -> list[ContentForTradeItem]:
     """
     查询许可证已关联的内容列表。
 
     输入参数：
         license_id      许可证 id
+        current_user    当前登录用户（本接口不做数据权限过滤，保留参数仅为路由层统一传入）
     输出：
         ContentForTradeItem 列表（包含 genre/original_name/release_year，内容模块完整实现前为 None）
     """
@@ -507,24 +601,33 @@ async def list_license_contents(
         )
     ).scalars().all()
 
+    content_ids = [row.content_id for row in rows]
+    if not content_ids:
+        return []
+
+    query = select(Content).where(
+        Content.id.in_(content_ids),
+        Content.is_deleted.is_(False),
+        Content.is_discarded.is_(False),
+    )
+    # 详情页已关联列表不做内容数据权限过滤：
+    # 许可证详情进入权由许可证模块权限控制，能进详情页就应看到它关联了什么；
+    # 数据权限控制仅保留在“添加内容弹框”（list_available_contents），
+    # 前端点详情跳转内容详情页时仍走数据权限校验（checkAndNavigateToContent）
+    contents = (await db.execute(query)).scalars().all()
+
     result: list[ContentForTradeItem] = []
-    for row in rows:
-        c = (
-            await db.execute(
-                select(Content).where(Content.id == row.content_id, Content.is_deleted.is_(False))
-            )
-        ).scalar_one_or_none()
-        if c:
-            result.append(ContentForTradeItem(
-                id=c.id,
-                content_type=c.content_type,
-                title=c.title,
-                status=c.status,
-                license_names=[],
-                genre=await _get_genre_name(db, c.genre_id),
-                original_name=None,
-                release_year=None,
-            ))
+    for c in contents:
+        result.append(ContentForTradeItem(
+            id=c.id,
+            content_type=c.content_type,
+            title=c.title,
+            status=c.status,
+            license_names=[],
+            genre=await _get_genre_names(db, c.id),
+            original_name=None,
+            release_year=None,
+        ))
     return result
 
 
@@ -532,6 +635,7 @@ async def add_contents_to_license(
     db: AsyncSession,
     license_id: int,
     req: ContentAddToLicenseRequest,
+    current_user: User | None = None,
 ) -> list[ContentForTradeItem]:
     """
     向许可证添加内容关联（支持批量，幂等）。
@@ -539,8 +643,15 @@ async def add_contents_to_license(
     输入参数：
         license_id      许可证 id
         req.content_ids 要关联的内容 id 列表
+        current_user    当前登录用户（用于数据权限过滤）
     输出：
         关联成功后，返回当前许可证已关联内容列表
+
+    业务规则：
+        - 总季（SEASON）添加时，自动级联传播给其下所有单季和单集
+        - 单季/单集独立添加不影响父级和其他兄弟节点
+        - 幂等：已关联的内容不重复创建关联，但父级内容（SEASON/SEASON_SERIES/SERIES）
+          即使已关联也会触发级联同步（补齐子节点缺失的许可证关联）
     """
     logger.info(f"add_contents_to_license 入参: license_id={license_id}, req={req}")
     await _get_license_or_404(db, license_id)
@@ -567,28 +678,200 @@ async def add_contents_to_license(
     ).scalars().all()
     soft_deleted_map = {row.content_id: row for row in soft_deleted_rows}
 
+    # ── 收集 SEASON / SEASON_SERIES / SERIES 类型的内容 id，用于后续级联传播 ──
+    season_content_ids: list[int] = []
+    season_series_content_ids: list[int] = []
+    series_content_ids: list[int] = []
+
+    # 本次实际新增关联的内容 id（用于状态回退）
+    newly_linked_ids: list[int] = []
+
     for cid in req.content_ids:
-        if cid in existing_ids:
-            continue
+        # 先查询内容并收集类型（须在幂等跳过之前）：
+        # 即使许可证已关联该内容（cid in existing_ids），若是 SEASON/SEASON_SERIES/SERIES，
+        # 也必须纳入级联同步——否则"重复绑定同一许可证"时子节点永远无法补齐缺失关联
+        # （bug：导入的子内容未自动关联总季绑定的许可证）。
         content = (
             await db.execute(
                 select(Content).where(Content.id == cid, Content.is_deleted.is_(False))
             )
         ).scalar_one_or_none()
         if not content:
-            raise BusinessException(ErrorCode.CONTENT_ID_NOT_FOUND, get_msg("CONTENT_ID_NOT_FOUND"))
+            raise BusinessException(ErrorCode.CONTENT_ID_NOT_FOUND, get_msg("CONTENT_ID_NOT_FOUND", cid=cid))
+
+        if content.content_type == ContentType.SEASON.value:
+            season_content_ids.append(cid)
+        elif content.content_type == ContentType.SEASON_SERIES.value:
+            season_series_content_ids.append(cid)
+        elif content.content_type == ContentType.SERIES.value:
+            series_content_ids.append(cid)
+
+        if cid in existing_ids:
+            continue
         if cid in soft_deleted_map:
             soft_deleted_map[cid].is_deleted = False
         else:
             db.add(LicenseContent(license_id=license_id, content_id=cid))
         existing_ids.add(cid)
+        newly_linked_ids.append(cid)
+
+    # ── 级联同步：SEASON / SEASON_SERIES / SERIES 操作时，子节点全量同步为父节点的许可证集合 ──
+    # 级联同步中发生实际变更的子节点：(child_id, "add"|"remove", 变更的 license_id 集合)，
+    # 用于同步完成后补写操作日志（无实际变更的子节点不写，保证幂等）
+    cascade_changes: list[tuple[int, str, set[int]]] = []
+    parent_ids_for_sync: list[int] = list(set(season_content_ids + season_series_content_ids + series_content_ids))
+    if parent_ids_for_sync:
+        for parent_id in parent_ids_for_sync:
+            # 1. 获取父节点操作后的完整 license_id 集合
+            parent_license_ids: set[int] = set(
+                (
+                    await db.execute(
+                        select(LicenseContent.license_id).where(
+                            LicenseContent.content_id == parent_id,
+                            LicenseContent.is_deleted.is_(False),
+                        )
+                    )
+                ).scalars().all()
+            )
+
+            # 2. 获取所有子节点 id
+            if parent_id in season_content_ids:
+                child_ids = await _get_season_descendant_ids(db, parent_id)
+                parent_type = "SEASON"
+            elif parent_id in season_series_content_ids:
+                child_ids = await _get_season_series_child_ids(db, parent_id)
+                parent_type = "SEASON_SERIES"
+            else:
+                child_ids = await _get_series_child_ids(db, parent_id)
+                parent_type = "SERIES"
+
+            if not child_ids:
+                continue
+
+            logger.info(
+                f"[级联同步] {parent_type} #{parent_id} 同步 {len(child_ids)} 个子节点，"
+                f"目标许可证集合: {parent_license_ids}"
+            )
+
+            # 3. 批量查询所有子节点当前的 (content_id, license_id) 关联
+            child_license_rows = (
+                await db.execute(
+                    select(
+                        LicenseContent.content_id,
+                        LicenseContent.license_id,
+                    ).where(
+                        LicenseContent.content_id.in_(child_ids),
+                        LicenseContent.is_deleted.is_(False),
+                    )
+                )
+            ).all()
+            child_license_map: dict[int, set[int]] = {}
+            for cr in child_license_rows:
+                child_license_map.setdefault(cr.content_id, set()).add(cr.license_id)
+
+            # 4. 逐个子节点同步
+            for child_id in child_ids:
+                child_current = child_license_map.get(child_id, set())
+
+                # 需要删除的：子节点有但父节点没有的
+                extra_ids = child_current - parent_license_ids
+                if extra_ids:
+                    await db.execute(
+                        update(LicenseContent)
+                        .where(
+                            LicenseContent.content_id == child_id,
+                            LicenseContent.license_id.in_(extra_ids),
+                            LicenseContent.is_deleted.is_(False),
+                        )
+                        .values(is_deleted=True)
+                    )
+                    cascade_changes.append((child_id, "remove", extra_ids))
+                    logger.info(
+                        f"[级联同步] 子节点 #{child_id} 移除多余许可证: {extra_ids}"
+                    )
+
+                # 需要添加的：父节点有但子节点没有的
+                missing_ids = parent_license_ids - child_current
+                if missing_ids:
+                    # 检查是否存在已软删除的记录（恢复用）
+                    soft_rows = (
+                        await db.execute(
+                            select(LicenseContent).where(
+                                LicenseContent.content_id == child_id,
+                                LicenseContent.license_id.in_(missing_ids),
+                                LicenseContent.is_deleted.is_(True),
+                            )
+                        )
+                    ).scalars().all()
+                    soft_map = {r.license_id: r for r in soft_rows}
+
+                    for missing_lid in missing_ids:
+                        if missing_lid in soft_map:
+                            soft_map[missing_lid].is_deleted = False
+                        else:
+                            db.add(LicenseContent(license_id=missing_lid, content_id=child_id))
+                    cascade_changes.append((child_id, "add", missing_ids))
+                    logger.info(
+                        f"[级联同步] 子节点 #{child_id} 补充缺失许可证: {missing_ids}"
+                    )
+
+    # ── 级联同步补写操作日志 ──
+    # 级联同步虽是数据一致性传播，但子节点的许可证集合实际发生了变化，
+    # 需为每个发生实际变更的子节点写日志（content_id=子节点id），
+    # 保证子节点（单季/单集）详情页 Activity Log 可见许可证变化
+    if cascade_changes:
+        license_obj = await _get_license_or_404(db, license_id)
+        log_user_id = current_user.id if current_user else None
+        log_user_name = current_user.username if current_user else "system"
+        for child_id, action, changed_ids in cascade_changes:
+            is_add = action == "add"
+            raw_val = json.dumps({
+                "license_id": license_id,
+                "license_name": license_obj.name,
+                "cascade": True,
+                "changed_license_ids": sorted(changed_ids),
+            }, ensure_ascii=False)
+            snapshot_val = json.dumps({"license_name": license_obj.name}, ensure_ascii=False)
+            await write_log(
+                db,
+                user_id=log_user_id,
+                user_name=log_user_name,
+                operation_type=OperationType.LICENSE_CONTENT_ADD if is_add else OperationType.LICENSE_CONTENT_REMOVE,
+                operation_object_code="log.license.link" if is_add else "log.license.unlink",
+                operation_content_code="log.license.link" if is_add else "log.license.unlink",
+                content_id=child_id,
+                entity_type="license",
+                entity_id=license_id,
+                previous_value=snapshot_val if not is_add else None,
+                updated_value=snapshot_val if is_add else None,
+                updated_value_json=raw_val,
+                result="success",
+            )
+
+    # ── 状态回退：改谁的许可证就回退谁（仅自身，不级联子类） ──
+    # 级联同步只是数据一致性传播（父级许可证集合同步给子节点），
+    # 不视为对子节点的编辑，故只回退被直接操作的内容。
+    if newly_linked_ids:
+        from app.internal.cms_biz_orchestration.services.workflow_service import rollback_after_published_edit
+        from app.internal.cms_biz_orchestration.repositories.content_repository import get_content_by_id
+        edited_by = current_user.username if current_user else "system"
+        for cid in newly_linked_ids:
+            content = await get_content_by_id(db, cid)
+            if content:
+                logger.info(
+                    f"[许可证关联] 内容 #{cid} 新增许可证 {license_id}，回退自身状态（不影响子类）"
+                )
+                await rollback_after_published_edit(
+                    db, cid, content.content_type, edited_by, "关联许可证"
+                )
 
     await db.commit()
-    return await list_license_contents(db, license_id)
+    return await list_license_contents(db, license_id, current_user)
 
 
 async def remove_content_from_license(
-    db: AsyncSession, license_id: int, content_id: int
+    db: AsyncSession, license_id: int, content_id: int, processed_by: str | None = None,
+    current_user: User | None = None,
 ) -> None:
     """
     从许可证移除内容关联（软删除）。
@@ -596,9 +879,27 @@ async def remove_content_from_license(
     输入参数：
         license_id      许可证 id
         content_id      要移除的内容 id
+        current_user    当前登录用户（用于级联日志的操作人）
+
+    业务规则：
+        - 若移除的是总季（SEASON），同时级联移除其下所有单季和单集的同许可证关联
+        - 若移除的是单季（SEASON_SERIES），同时级联移除其下所有单集的同许可证关联
+        - 若移除的是普通连续剧（SERIES），同时级联移除其下所有单集的同许可证关联
+        - 单集独立移除不影响父级
+        - 状态回退仅作用于被直接操作的内容自身，不级联子类
+        - 级联移除的子节点补写操作日志（content_id=子节点id），保证子节点详情页 Activity Log 可见
     """
     logger.info(f"remove_content_from_license 入参: license_id={license_id}, content_id={content_id}")
     await _get_license_or_404(db, license_id)
+
+    # 先查出被移除内容的类型，判断是否需要级联
+    content = (
+        await db.execute(
+            select(Content).where(Content.id == content_id, Content.is_deleted.is_(False))
+        )
+    ).scalar_one_or_none()
+
+    # 移除自身的 LicenseContent 关联
     row = (
         await db.execute(
             select(LicenseContent).where(
@@ -610,7 +911,76 @@ async def remove_content_from_license(
     ).scalar_one_or_none()
     if row:
         row.is_deleted = True
-        await db.commit()
+
+    # ── 级联移除 ──
+    if content:
+        if content.content_type == ContentType.SEASON.value:
+            descendant_ids = await _get_season_descendant_ids(db, content_id)
+        elif content.content_type == ContentType.SEASON_SERIES.value:
+            descendant_ids = await _get_season_series_child_ids(db, content_id)
+        elif content.content_type == ContentType.SERIES.value:
+            descendant_ids = await _get_series_child_ids(db, content_id)
+        else:
+            descendant_ids = []
+
+        if descendant_ids:
+            descendant_rows = (
+                await db.execute(
+                    select(LicenseContent).where(
+                        LicenseContent.license_id == license_id,
+                        LicenseContent.content_id.in_(descendant_ids),
+                        LicenseContent.is_deleted.is_(False),
+                    )
+                )
+            ).scalars().all()
+            for descendant_row in descendant_rows:
+                descendant_row.is_deleted = True
+            logger.info(
+                f"[级联许可证] {content.content_type} #{content_id} 移除许可证 {license_id}，"
+                f"级联移除 {len(descendant_rows)} 个子节点的关联"
+            )
+
+            # 级联移除的子节点补写操作日志（content_id=子节点id），
+            # 保证子节点（单季/单集）详情页 Activity Log 可见许可证移除
+            license_obj = await _get_license_or_404(db, license_id)
+            log_user_id = current_user.id if current_user else None
+            log_user_name = current_user.username if current_user else (processed_by or "system")
+            snapshot_val = json.dumps({"license_name": license_obj.name}, ensure_ascii=False)
+            for descendant_row in descendant_rows:
+                raw_val = json.dumps({
+                    "license_id": license_id,
+                    "license_name": license_obj.name,
+                    "cascade": True,
+                    "cascade_from": content_id,
+                }, ensure_ascii=False)
+                await write_log(
+                    db,
+                    user_id=log_user_id,
+                    user_name=log_user_name,
+                    operation_type=OperationType.LICENSE_CONTENT_REMOVE,
+                    operation_object_code="log.license.unlink",
+                    operation_content_code="log.license.unlink",
+                    content_id=descendant_row.content_id,
+                    entity_type="license",
+                    entity_id=license_id,
+                    previous_value=snapshot_val,
+                    updated_value_json=raw_val,
+                    result="success",
+                )
+
+    # ── 状态回退：改谁的许可证就回退谁（仅自身，不级联子类） ──
+    # 级联移除只是数据一致性传播，不视为对子节点的编辑。
+    if row and content:
+        from app.internal.cms_biz_orchestration.services.workflow_service import rollback_after_published_edit
+        logger.info(
+            f"[许可证关联] 内容 #{content_id} 移除许可证 {license_id}，回退自身状态（不影响子类）"
+        )
+        await rollback_after_published_edit(
+            db, content_id, content.content_type,
+            processed_by or "system", "移除许可证"
+        )
+
+    await db.commit()
 
 
 async def list_available_contents(
@@ -621,8 +991,9 @@ async def list_available_contents(
     title: str | None = None,
     content_types: list[str] | None = None,
     ingest_statuses: list[str] | None = None,
-    genres: list[str] | None = None,
+    genre_ids: list[int] | None = None,
     without_license: bool = False,
+    current_user: User | None = None,
 ) -> PaginatedResponse[ContentForTradeItem]:
     """
     查询可添加至许可证的内容列表（排除已关联内容）。
@@ -636,11 +1007,12 @@ async def list_available_contents(
         ingest_statuses Ingest 状态过滤列表（对应 content.status）
         genres          题材过滤（内容模块完整实现后生效，当前为 no-op）
         without_license 仅返回未关联任何许可证的内容
+        current_user    当前登录用户（用于数据权限过滤）
 
     输出：
         PaginatedResponse[ContentForTradeItem]
     """
-    logger.info(f"list_available_contents 入参: license_id={license_id}, page={page}, page_size={page_size}, title={title}, content_types={content_types}, ingest_statuses={ingest_statuses}, genres={genres}, without_license={without_license}")
+    logger.info(f"list_available_contents 入参: license_id={license_id}, page={page}, page_size={page_size}, title={title}, content_types={content_types}, ingest_statuses={ingest_statuses}, genre_ids={genre_ids}, without_license={without_license}")
     already_linked = set(
         (
             await db.execute(
@@ -652,7 +1024,9 @@ async def list_available_contents(
         ).scalars().all()
     )
 
-    query = select(Content).where(Content.is_deleted.is_(False))
+    query = select(Content).where(Content.is_deleted.is_(False), Content.is_discarded.is_(False))
+
+    query = await apply_content_data_auth(db, current_user, query)
 
     if already_linked:
         query = query.where(Content.id.notin_(already_linked))
@@ -662,7 +1036,9 @@ async def list_available_contents(
         query = query.where(Content.content_type.in_(content_types))
     if ingest_statuses:
         query = query.where(Content.status.in_(ingest_statuses))
-    # genres 过滤：内容模块完整实现前 no-op（content 表尚无 genre 字段）
+    if genre_ids:
+        subq = select(ContentGenre.content_id).where(ContentGenre.genre_id.in_(genre_ids))
+        query = query.where(Content.id.in_(subq))
     if without_license:
         sub_lc = select(LicenseContent.content_id).where(LicenseContent.is_deleted.is_(False))
         query = query.where(Content.id.notin_(sub_lc))
@@ -702,7 +1078,7 @@ async def list_available_contents(
             title=c.title,
             status=c.status,
             license_names=lic_names,
-            genre=await _get_genre_name(db, c.genre_id),
+            genre=await _get_genre_names(db, c.id),
             original_name=None,
             release_year=None,
         ))
@@ -717,7 +1093,8 @@ async def list_unlicensed_contents(
     title: str | None = None,
     content_types: list[str] | None = None,
     ingest_statuses: list[str] | None = None,
-    genres: list[str] | None = None,
+    genre_ids: list[int] | None = None,
+    current_user: User | None = None,
 ) -> PaginatedResponse[ContentForTradeItem]:
     """
     查询未关联任何许可证的内容列表（用于"添加内容至合同"弹框左栏初始状态）。
@@ -728,13 +1105,16 @@ async def list_unlicensed_contents(
         title           内容标题关键字（模糊匹配）
         content_types   内容类型过滤列表
         ingest_statuses Ingest 状态过滤列表
-        genres          题材过滤（当前为 no-op）
+        genre_ids       题材 ID 过滤
+        current_user    当前登录用户（用于数据权限过滤）
 
     输出：
         PaginatedResponse[ContentForTradeItem]
     """
-    logger.info(f"list_unlicensed_contents 入参: page={page}, page_size={page_size}, title={title}, content_types={content_types}, ingest_statuses={ingest_statuses}, genres={genres}")
-    query = select(Content).where(Content.is_deleted.is_(False))
+    logger.info(f"list_unlicensed_contents 入参: page={page}, page_size={page_size}, title={title}, content_types={content_types}, ingest_statuses={ingest_statuses}, genre_ids={genre_ids}")
+    query = select(Content).where(Content.is_deleted.is_(False), Content.is_discarded.is_(False))
+
+    query = await apply_content_data_auth(db, current_user, query)
 
     if title:
         query = query.where(Content.title.ilike(f"%{title}%"))
@@ -742,7 +1122,9 @@ async def list_unlicensed_contents(
         query = query.where(Content.content_type.in_(content_types))
     if ingest_statuses:
         query = query.where(Content.status.in_(ingest_statuses))
-    # genres 过滤：内容模块完整实现前 no-op
+    if genre_ids:
+        subq = select(ContentGenre.content_id).where(ContentGenre.genre_id.in_(genre_ids))
+        query = query.where(Content.id.in_(subq))
     sub_lc = select(LicenseContent.content_id)
     query = query.where(Content.id.notin_(sub_lc))
 
@@ -777,7 +1159,7 @@ async def list_unlicensed_contents(
             title=c.title,
             status=c.status,
             license_names=lic_names,
-            genre=await _get_genre_name(db, c.genre_id),
+            genre=await _get_genre_names(db, c.id),
             original_name=None,
             release_year=None,
         ))
@@ -785,21 +1167,28 @@ async def list_unlicensed_contents(
     return PaginatedResponse(total=total, page=page, page_size=page_size, items=items)
 
 
-async def get_without_license_content_count(db: AsyncSession) -> int:
+async def get_without_license_content_count(
+    db: AsyncSession,
+    current_user: User | None = None,
+) -> int:
     """
     统计当前未关联任何许可证的内容数量。
+
+    输入参数：
+        current_user    当前登录用户（用于数据权限过滤）
 
     输出：
         整数，无许可证内容数量
     """
     logger.info(f"get_without_license_content_count 入参: 无")
     sub_lc = select(LicenseContent.content_id)
-    result = await db.execute(
-        select(func.count(Content.id)).where(
-            Content.is_deleted.is_(False),
-            Content.id.notin_(sub_lc),
-        )
+    query = select(Content).where(
+        Content.is_deleted.is_(False),
+        Content.id.notin_(sub_lc),
     )
+    query = await apply_content_data_auth(db, current_user, query)
+    count_query = select(func.count()).select_from(query.subquery())
+    result = await db.execute(count_query)
     return result.scalar_one()
 
 

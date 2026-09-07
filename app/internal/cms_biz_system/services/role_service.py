@@ -3,7 +3,8 @@ import uuid
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.internal.cms_biz_system.models.user import Role
+from app.internal.cms_biz_system.models.user import Role, UserRole
+from app.internal.cms_biz_system.models.content_auth import ContentAuth
 from app.common.schemas import PaginatedResponse
 from app.internal.cms_biz_system.schemas.user_crud import RoleCreate, RoleListItem, RoleUpdate
 from app.common.core.i18n import get_msg
@@ -23,6 +24,24 @@ async def _get_role_or_404(db: AsyncSession, role_id: int) -> Role:
 async def get_role_by_id(db: AsyncSession, role_id: int) -> Role:
     """按ID获取角色（含404处理）"""
     return await _get_role_or_404(db, role_id)
+
+
+async def _assert_role_not_in_use(db: AsyncSession, role: Role) -> None:
+    """删除前校验角色是否被引用：被数据权限授权或已分配给用户时禁止删除"""
+    in_auth = (await db.execute(
+        select(ContentAuth.id).where(
+            ContentAuth.role_id == role.id, ContentAuth.is_deleted.is_(False)
+        ).limit(1)
+    )).scalar_one_or_none()
+    if in_auth:
+        raise BusinessException(ErrorCode.ROLE_IN_USE, get_msg("ROLE_IN_USE", name=role.name))
+    assigned_user = (await db.execute(
+        select(UserRole.user_id).where(
+            UserRole.role_id == role.id, UserRole.is_deleted.is_(False)
+        ).limit(1)
+    )).scalar_one_or_none()
+    if assigned_user:
+        raise BusinessException(ErrorCode.ROLE_ASSIGNED_TO_USER, get_msg("ROLE_ASSIGNED_TO_USER", name=role.name))
 
 
 async def list_roles(
@@ -129,6 +148,7 @@ async def delete_role(db: AsyncSession, role_id: int) -> None:
     role = await _get_role_or_404(db, role_id)
     if role.is_system:
         raise BusinessException(ErrorCode.SYSTEM_ROLE_CANNOT_DELETE, get_msg("SYSTEM_ROLE_CANNOT_DELETE"))
+    await _assert_role_not_in_use(db, role)
     role.is_deleted = True
     await db.commit()
 
@@ -147,6 +167,9 @@ async def batch_update_role_status(db: AsyncSession, ids: list[int], new_status:
     )).scalars().all()
     for r in roles:
         if new_status == "deleted":
+            if r.is_system:
+                raise BusinessException(ErrorCode.SYSTEM_ROLE_CANNOT_DELETE, get_msg("SYSTEM_ROLE_CANNOT_DELETE"))
+            await _assert_role_not_in_use(db, r)
             r.is_deleted = True
         else:
             r.status = new_status
@@ -162,6 +185,7 @@ async def batch_delete_roles(db: AsyncSession, ids: list[int]) -> int:
         if r.is_system:
             raise BusinessException(ErrorCode.SYSTEM_ROLE_CANNOT_DELETE, get_msg("SYSTEM_ROLE_CANNOT_DELETE"))
     for r in roles:
+        await _assert_role_not_in_use(db, r)
         r.is_deleted = True
     await db.commit()
     return len(roles)

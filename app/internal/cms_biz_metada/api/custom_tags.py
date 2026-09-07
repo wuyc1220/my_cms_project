@@ -27,13 +27,12 @@ async def get_custom_tag_list(
     page: int = 1,
     page_size: int = 10,
     name: str | None = None,
-    languages: list[str] | None = Query(default=None),
     sort_by: str | None = None,
     sort_order: str | None = None,
     db: AsyncSession = Depends(get_db),
     _: User = Depends(get_current_user),
 ):
-    return await list_custom_tags(db, page, page_size, name, languages, sort_by, sort_order)
+    return await list_custom_tags(db, page, page_size, name, sort_by, sort_order)
 
 
 @router.get("/{tag_id}", response_model=CustomTagListItem)
@@ -60,8 +59,8 @@ async def create_custom_tag_api(
         user_id=current_user.id,
         user_name=current_user.username,
         operation_type=OperationType.CUSTOM_TAG_CREATE,
-        operation_object=f"自定义标签 {body.name}",
-        operation_content=f"Created custom tag: name={body.name}",
+        operation_object_code="OBJ_CUSTOM_TAG", operation_object_params={"name": body.name},
+        operation_content_code="LOG_CUSTOM_TAG_CREATE", operation_content_params={"name": body.name},
         ip_address=_get_ip(request),
         result="success",
         previous_value=prev_val,
@@ -93,8 +92,8 @@ async def update_custom_tag_api(
         user_id=current_user.id,
         user_name=current_user.username,
         operation_type=OperationType.CUSTOM_TAG_EDIT,
-        operation_object=f"自定义标签 {old_name}",
-        operation_content=f"Updated custom tag: ID={tag_id}, name={tag.name}",
+        operation_object_code="OBJ_CUSTOM_TAG", operation_object_params={"name": old_name},
+        operation_content_code="LOG_CUSTOM_TAG_EDIT", operation_content_params={"name": tag.name},
         ip_address=_get_ip(request),
         result="success",
         previous_value=prev_val,
@@ -122,8 +121,8 @@ async def batch_delete_custom_tags_api(
         user_id=current_user.id,
         user_name=current_user.username,
         operation_type=OperationType.CUSTOM_TAG_BATCH_DELETE,
-        operation_object=f"自定义标签 {ct_names}",
-        operation_content=f"批量删除自定义标签: {ct_names}",
+        operation_object_code="OBJ_CUSTOM_TAG", operation_object_params={"name": ct_names},
+        operation_content_code="LOG_CUSTOM_TAG_BATCH_DELETE", operation_content_params={"names": ct_names},
         ip_address=_get_ip(request),
         result="success",
         entity_type="custom_tag",
@@ -150,8 +149,8 @@ async def delete_custom_tag_api(
         user_id=current_user.id,
         user_name=current_user.username,
         operation_type=OperationType.CUSTOM_TAG_DELETE,
-        operation_object=f"自定义标签 {tag_name}",
-        operation_content=f"Deleted custom tag: ID={tag_id}, name={tag_name}",
+        operation_object_code="OBJ_CUSTOM_TAG", operation_object_params={"name": tag_name},
+        operation_content_code="LOG_CUSTOM_TAG_DELETE", operation_content_params={"name": tag_name},
         ip_address=_get_ip(request),
         result="success",
         previous_value=prev_val,

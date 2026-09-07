@@ -22,6 +22,7 @@ from app.internal.cms_biz_system.services.menu_service import (
     delete_menu_by_id,
     assign_role_menus,
     get_role_menu_ids,
+    get_menus_by_ids,
 )
 
 router = APIRouter(prefix="/menus")
@@ -76,8 +77,8 @@ async def create_menu_api(
         user_id=current_user.id,
         user_name=current_user.username,
         operation_type=OperationType.MENU_CREATE,
-        operation_object=f"菜单 {body.name}",
-        operation_content=f"Created menu: name={body.name}",
+        operation_object_code="OBJ_MENU", operation_object_params={"name": body.name},
+        operation_content_code="LOG_MENU_CREATE", operation_content_params={"name": body.name},
         ip_address=_get_ip(request),
         result="success",
         previous_value=prev_val,
@@ -107,8 +108,8 @@ async def update_menu_api(
         user_id=current_user.id,
         user_name=current_user.username,
         operation_type=OperationType.MENU_EDIT,
-        operation_object=f"菜单 #{menu_id}",
-        operation_content=f"Updated menu: ID={menu_id}",
+        operation_object_code="OBJ_MENU", operation_object_params={"name": menu_id},
+        operation_content_code="LOG_MENU_EDIT", operation_content_params={"id": menu_id},
         ip_address=_get_ip(request),
         result="success",
         previous_value=prev_val,
@@ -135,8 +136,8 @@ async def delete_menu_api(
         user_id=current_user.id,
         user_name=current_user.username,
         operation_type=OperationType.MENU_DELETE,
-        operation_object=f"菜单 #{menu_id}",
-        operation_content=f"Deleted menu: ID={menu_id}",
+        operation_object_code="OBJ_MENU", operation_object_params={"name": menu_id},
+        operation_content_code="LOG_MENU_DELETE", operation_content_params={"id": menu_id},
         ip_address=_get_ip(request),
         result="success",
         entity_type="menu",
@@ -165,17 +166,37 @@ async def assign_role_menus_api(
     current_user: User = Depends(get_current_user),
 ):
     """分配角色菜单权限"""
+    # 变更前快照（用于操作日志前后值对比）
+    old_ids = set(await get_role_menu_ids(db, role_id))
+    old_menus = await get_menus_by_ids(db, list(old_ids)) if old_ids else []
+    old_data = {"menu_names": sorted(m.name for m in old_menus)}
+
     await assign_role_menus(db, role_id, body.menu_ids)
+
+    # 变更后快照
+    new_ids = set(await get_role_menu_ids(db, role_id))
+    new_menus = await get_menus_by_ids(db, list(new_ids)) if new_ids else []
+    new_data = {"menu_names": sorted(m.name for m in new_menus)}
+    prev_val, new_val, raw_val = await prepare_log_values(db, "role", old_data, new_data)
+
+    # 查询角色名用于日志展示（assign_role_menus 内部已校验角色存在）
+    from app.internal.cms_biz_system.repositories import get_role_by_id
+    role = await get_role_by_id(db, role_id)
+    role_name = role.name if role else str(role_id)
     await write_log(
         db,
         user_id=current_user.id,
         user_name=current_user.username,
         operation_type=OperationType.MENU_ASSIGN,
-        operation_object=f"角色 #{role_id} 菜单权限",
-        operation_content=f"Assigned menus to role: role_id={role_id}, menu_ids={body.menu_ids}",
+        operation_object_code="OBJ_ROLE", operation_object_params={"name": role_name},
+        operation_content_code="LOG_MENU_ASSIGN", operation_content_params={"name": role_name, "count": len(body.menu_ids or [])},
         ip_address=_get_ip(request),
         result="success",
-        entity_type="menu",
+        previous_value=prev_val,
+        updated_value=new_val,
+        updated_value_json=raw_val,
+        entity_type="role",
+        entity_id=role_id,
     )
     await db.commit()
     return {"success": True}

@@ -8,7 +8,7 @@
 - 创建时自动填充 name（默认同 content.title）
 - 创建时自动判定 series_flag
 - Series Update Childs 批量同步
-- 更新元数据 genre_id 时同步到 content.genre_id
+- 更新元数据 genre_ids 时同步到 content_genre 中间表
 """
 
 from typing import Optional
@@ -21,7 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.common.core.exceptions import BusinessException, ErrorCode, NotFoundException
 from app.common.core.transactions import transactional
-from app.internal.cms_biz_package.models.package import Content, ContentCustomTag
+from app.internal.cms_biz_package.models.package import Content, ContentGenre, ContentCustomTag
 from app.internal.cms_biz_metada.models.basic import CustomTag, EntityFieldValue, EntityI18n
 from app.internal.cms_biz_orchestration.models.content_metadata import (
     ContentMetadata,
@@ -47,6 +47,8 @@ from app.internal.cms_biz_orchestration.schemas.content_metadata import (
 from app.internal.cms_biz_orchestration.repositories import metadata_repo
 from app.internal.cms_biz_orchestration.services.workflow_service import (
     complete_process_and_update_status,
+    rollback_after_published_edit,
+    record_status_change,
 )
 from app.internal.cms_biz_orchestration.services.metadata_validation_service import validate_metadata
 from app.common.core.i18n import get_msg
@@ -69,10 +71,13 @@ async def _get_content_or_404(db: AsyncSession, content_id: int) -> Content:
 
 
 # 不参与 Update Childs 同步的字段（系统维护字段）
+# cdr_id 为每级内容独立的唯一标识（Series_{id} / Program_{id}），
+# 快照同步时必须排除，避免子级被父级 CDR ID 覆盖
 _UPDATE_CHILDS_EXCLUDE = {
     "id", "created_at", "updated_at", "created_by", "updated_by",
     "is_deleted", "is_discarded",
     "volume_count", "series_type", "series_ordinal", "show_id",
+    "cdr_id",
 }
 
 
@@ -106,6 +111,16 @@ async def _sync_custom_tags(db: AsyncSession, content_id: int, custom_tag_ids: l
                 db.add(assoc)
             else:
                 logger.warning("自定义标签 ID={} 不存在或已删除，跳过", tag_id)
+
+
+def _has_real_changes(metadata, update_data: dict) -> bool:
+    """在 setattr 之前逐字段比较当前持久化值与待写入值，判断是否存在实际变更。
+
+    必须在 setattr 循环之前调用：SQLAlchemy 的 inspect(obj).modified
+    对同值赋值也会返回 True，无法用于实际变更检测，否则会在
+    “创建+同步连调”等场景误写第二条父级流程记录。
+    """
+    return any(getattr(metadata, key) != value for key, value in update_data.items())
 
 
 # ═══════════════════════════════════════════════════════════
@@ -147,22 +162,31 @@ async def create_content_metadata(
         dump["name"] = content.title
     # 自动判定 series_flag: MOVIE→0, EPISODE→1
     dump["series_flag"] = 0 if content.content_type == "MOVIE" else 1
-    
-    # 移除 genre_id，不保存到元数据表（它存储在 content 主表）
-    dump.pop("genre_id", None)
+    # 自动生成 CDR ID: Program_{content_id}
+    if not dump.get("cdr_id") or dump.get("cdr_id") == "":
+        dump["cdr_id"] = f"Program_{data.content_id}"
+
+    # 移除 genre_ids，不保存到元数据表（它存储在 content_genre 中间表）
+    genre_ids = dump.pop("genre_ids", None)
 
     metadata = ContentMetadata(**dump)
     await metadata_repo.add_content_metadata(db, metadata)
     await db.flush()
     await db.refresh(metadata)
 
-    # 完成 Metadata 流程节点并更新内容状态
+    # 保存题材关联到中间表
+    if genre_ids:
+        for gid in genre_ids:
+            db.add(ContentGenre(content_id=data.content_id, genre_id=gid))
+
+    # 用户主动创建元数据弹窗，直接记 Passed（用户确认即完成）
     await complete_process_and_update_status(
         db,
         content_id=data.content_id,
         content_type=content.content_type,
         process_name="Metadata",
         processed_by=processed_by,
+        record_status="Passed",
         info="创建元数据",
     )
 
@@ -190,24 +214,39 @@ async def update_content_metadata(
     # )
 
     update_data = data.model_dump(exclude_unset=True)
+    # 在 setattr 前检测实际变更（inspect().modified 对同值赋值也返回 True）
+    has_metadata_changes = _has_real_changes(metadata, update_data)
     for key, value in update_data.items():
         setattr(metadata, key, value)
 
     await db.flush()
     await db.refresh(metadata)
 
-    # 完成 Metadata 流程节点并更新内容状态
+    # 自动生成 CDR ID: Program_{content_id}（与创建路径 data.content_id 口径一致）
+    if not metadata.cdr_id:
+        metadata.cdr_id = f"Program_{content_id}"
+        await db.flush()
+
     content = await _get_content_or_404(db, content_id)
+    await rollback_after_published_edit(db, content_id, content.content_type, processed_by or "system", "修改元数据")
+
+    # 用户主动保存元数据弹窗（含主表/自定义/多语言任一变更），每次都写一条 Passed 记录。
+    # 流程记录与状态判断解耦：保存即记录，状态固定 Passed（用户主动确认即完成），
+    # 不再以"主表是否有变更"或"是否已有 Passed 记录"作为是否写入的条件。
     await complete_process_and_update_status(
         db,
         content_id=content_id,
         content_type=content.content_type,
         process_name="Metadata",
         processed_by=processed_by,
-        info="更新元数据",
+        record_status="Passed",
+        info="更新元数据" if has_metadata_changes else "确认元数据（仅自定义/多语言变更）",
     )
 
     logger.info("更新 Program 元数据 | content_id={}", content_id)
+
+    # 刷新后再转换为 Pydantic 模型，避免 flush 后 ORM 属性过期触发绿色线程错误
+    await db.refresh(metadata)
     return ContentMetadataItem.model_validate(metadata)
 
 
@@ -216,6 +255,11 @@ async def delete_content_metadata(db: AsyncSession, content_id: int) -> None:
     """软删除 Program 元数据。"""
     await metadata_repo.delete_content_metadata_by_content_id(db, content_id)
     logger.info("删除 Program 元数据 | content_id={}", content_id)
+    # 删除元数据属于节点数据变更，回退内容状态（已发布/准备发布等 → InProgress）
+    content = await _get_content_or_404(db, content_id)
+    await rollback_after_published_edit(
+        db, content_id, content.content_type, "system", "删除元数据"
+    )
 
 
 # ═══════════════════════════════════════════════════════════
@@ -236,7 +280,7 @@ async def create_series_metadata(
 ) -> SeriesMetadataItem:
     """创建 Series 元数据。"""
     content = await _get_content_or_404(db, data.content_id)
-    if content.content_type not in ("SERIES", "SEASON"):
+    if content.content_type not in ("SERIES", "SEASON", "SEASON_SERIES"):
         raise BusinessException(ErrorCode.VALIDATION_ERROR, get_msg("CONTENT_TYPE_INVALID"), 400)
 
     existing = await metadata_repo.get_series_metadata_by_content_id(db, data.content_id)
@@ -255,22 +299,31 @@ async def create_series_metadata(
     dump = data.model_dump()
     if not dump.get("name"):
         dump["name"] = content.title
-    
-    # 移除 genre_id，不保存到元数据表（它存储在 content 主表）
-    dump.pop("genre_id", None)
+    # 自动生成 CDR ID: Series_{content_id}
+    if not dump.get("cdr_id") or dump.get("cdr_id") == "":
+        dump["cdr_id"] = f"Series_{data.content_id}"
+
+    # 移除 genre_ids，不保存到元数据表（它存储在 content_genre 中间表）
+    genre_ids = dump.pop("genre_ids", None)
 
     metadata = SeriesMetadata(**dump)
     await metadata_repo.add_series_metadata(db, metadata)
     await db.flush()
     await db.refresh(metadata)
 
-    # 完成 Metadata 流程节点并更新内容状态
+    # 保存题材关联到中间表
+    if genre_ids:
+        for gid in genre_ids:
+            db.add(ContentGenre(content_id=data.content_id, genre_id=gid))
+
+    # 用户主动创建元数据弹窗，直接记 Passed（用户确认即完成）
     await complete_process_and_update_status(
         db,
         content_id=data.content_id,
         content_type=content.content_type,
         process_name="Metadata",
         processed_by=processed_by,
+        record_status="Passed",
         info="创建 Series 元数据",
     )
 
@@ -280,7 +333,10 @@ async def create_series_metadata(
 
 @transactional
 async def update_series_metadata(
-    db: AsyncSession, content_id: int, data: SeriesMetadataUpdate, processed_by: str | None = None
+    db: AsyncSession, content_id: int, data: SeriesMetadataUpdate,
+    processed_by: str | None = None,
+    actor_id: int | None = None,
+    ip_address: str | None = None,
 ) -> SeriesMetadataItem:
     """更新 Series 元数据。"""
     metadata = await metadata_repo.get_series_metadata_by_content_id(db, content_id)
@@ -306,17 +362,23 @@ async def update_series_metadata(
         "更新 Series 元数据 | content_id={} update_childs_main={} update_childs_custom_fields={} update_childs_i18n={}",
         content_id, update_childs_main, update_childs_custom_fields, update_childs_i18n
     )
-    # 提取 genre_id 用于同步（它存储在 content 主表，不保存到元数据表）
-    genre_id_for_sync = update_data.get("genre_id")
-    update_data.pop("genre_id", None)
+    # 提取 genre_ids 用于同步（它存储在 content_genre 中间表，不保存到元数据表）
+    genre_ids_for_sync = update_data.get("genre_ids")
+    update_data.pop("genre_ids", None)
 
+    # 在 setattr 前检测实际变更：inspect().modified 对同值赋值也返回 True，
+    # 会在“创建+同步连调”场景误写第二条父级流程记录
+    has_metadata_changes = _has_real_changes(metadata, update_data)
     for key, value in update_data.items():
         setattr(metadata, key, value)
-    
-    # 同步 genre_id 到父级 content 主表
-    if genre_id_for_sync is not None:
-        content = await _get_content_or_404(db, content_id)
-        content.genre_id = genre_id_for_sync
+
+    # 同步 genre_ids 到 content_genre 中间表
+    if genre_ids_for_sync is not None:
+        await db.execute(
+            ContentGenre.__table__.delete().where(ContentGenre.content_id == content_id)
+        )
+        for gid in genre_ids_for_sync:
+            db.add(ContentGenre(content_id=content_id, genre_id=gid))
 
     # Update Childs: 各标签页独立控制
     if update_childs_main or update_childs_custom_fields or update_childs_i18n:
@@ -324,12 +386,12 @@ async def update_series_metadata(
             "Update Childs 条件满足，开始调用同步函数 | content_id={} main={} custom={} i18n={}",
             content_id, update_childs_main, update_childs_custom_fields, update_childs_i18n
         )
-        # 将 genre_id 加入 update_data 以便传递给同步函数
-        if genre_id_for_sync is not None:
-            update_data["genre_id"] = genre_id_for_sync
         await _sync_series_to_children(
-            db, content_id, update_data,
-            update_childs_main, update_childs_custom_fields, update_childs_i18n
+            db, content_id,
+            update_childs_main, update_childs_custom_fields, update_childs_i18n,
+            processed_by,
+            actor_id=actor_id,
+            ip_address=ip_address,
         )
         logger.info("Update Childs 同步函数执行完成 | content_id={}", content_id)
     else:
@@ -341,15 +403,24 @@ async def update_series_metadata(
     await db.flush()
     await db.refresh(metadata)
 
-    # 完成 Metadata 流程节点并更新内容状态
     content = await _get_content_or_404(db, content_id)
+    await rollback_after_published_edit(db, content_id, content.content_type, processed_by or "system", "修改元数据")
+
+    # 检查是否有实际变更，避免仅保存自定义字段时也记录 Metadata 流程
+    has_genre_changes = genre_ids_for_sync is not None
+
+    # 用户主动保存元数据弹窗（含主表/自定义/多语言任一变更），每次都写一条 Passed 记录。
+    # 流程记录与状态判断解耦：保存即记录，状态固定 Passed（用户主动确认即完成），
+    # 不再以"主表是否有变更"或"是否已有 Passed 记录"作为是否写入的条件。
     await complete_process_and_update_status(
         db,
         content_id=content_id,
         content_type=content.content_type,
         process_name="Metadata",
         processed_by=processed_by,
-        info="更新 Series 元数据",
+        record_status="Passed",
+        info=("更新 Series 元数据" if (has_metadata_changes or has_genre_changes)
+              else "确认 Series 元数据（仅自定义/多语言变更）"),
     )
 
     logger.info(
@@ -360,46 +431,54 @@ async def update_series_metadata(
 
 
 async def _sync_series_to_children(
-    db: AsyncSession, parent_id: int, update_data: dict,
+    db: AsyncSession, parent_id: int,
     update_childs_main: bool = False,
     update_childs_custom_fields: bool = False,
     update_childs_i18n: bool = False,
+    processed_by: str | None = None,
+    actor_id: int | None = None,
+    ip_address: str | None = None,
 ) -> None:
     """将 Series 元数据批量同步至子内容节点（递归同步所有层级）。
 
     同步策略：
         1. 从父级 content 表获取 title、genre_id
-        2. 从父级元数据表获取 23 个字段
+        2. 从父级元数据表读取全量字段快照（而非本次提交的字段 diff），
+           确保子级缺失的必填字段（type_id/vod_type/rating_level 等）能一次补齐
         3. 从 content_custom_tag 表获取自定义标签
-        4. 递归同步到所有子级（SEASON → SERIES → EPISODE）
+        4. 递归同步到所有子级（SEASON → SEASON_SERIES → EPISODE）
         5. 强制覆盖子级数据
         6. 记录操作日志
-    
+
     排除字段：
         - volume_count, series_type, series_ordinal, show_id（系统维护）
+        - cdr_id（每级内容独立生成的唯一标识，不可被父级覆盖）
         - 审计字段（created_at, updated_at 等）
-    
+
     参数：
         parent_id: 父级内容 ID
-        update_data: 更新的元数据字典（包含 genre_id）
     """
     # 1. 获取父级内容
     parent = await _get_content_or_404(db, parent_id)
     parent_type = parent.content_type
-    
+
     logger.info(
-        "Update Childs 开始同步 | parent_id={} parent_type={} parent_title={} update_data_keys={}",
-        parent_id, parent_type, parent.title, list(update_data.keys())
+        "Update Childs 开始同步 | parent_id={} parent_type={} parent_title={} main={} custom={} i18n={}",
+        parent_id, parent_type, parent.title,
+        update_childs_main, update_childs_custom_fields, update_childs_i18n,
     )
-    
-    if parent_type not in ("SERIES", "SEASON"):
+
+    if parent_type not in ("SERIES", "SEASON_SERIES", "SEASON"):
         logger.warning("Update Childs 仅支持 SERIES/SEASON 类型 | parent_id={} type={}", parent_id, parent_type)
         return
-    
-    # 2. 构建同步数据包（从 content 主表）
-    # 注意：只同步 genre_id，不同步 title（子级 title 保持独立）
+
+    # 2. 构建同步数据包（从 content_genre 中间表获取 genre_ids）
+    genre_rows = await db.execute(
+        select(ContentGenre.genre_id).where(ContentGenre.content_id == parent_id)
+    )
+    parent_genre_ids = [r[0] for r in genre_rows.all()]
     sync_content_fields = {
-        "genre_id": parent.genre_id,
+        "genre_ids": parent_genre_ids,
     }
     
     # 3. 根据开关按需获取父级数据
@@ -445,8 +524,8 @@ async def _sync_series_to_children(
             )
         )
         for row in parent_i18n_result.scalars().all():
-            # field_name 格式为 'cf_test_A_initial'，截取 'cf_' 前缀得到 field_code
-            field_code = row.field_name[3:] if row.field_name.startswith("cf_") else row.field_name
+            # field_name 即 field_code（如 "cf_3"）
+            field_code = row.field_name
             parent_multilang_values[field_code][row.language] = row.value
         if parent_multilang_values:
             logger.info(
@@ -472,19 +551,30 @@ async def _sync_series_to_children(
             )
     
     
-    # 4. 过滤出需要同步的元数据字段（Main 标签）
+    # 4. 构建父级元数据完整快照（Main 标签）
+    #    使用父级元数据表的全量列（同一事务内本次 setattr 更新已应用到该对象），
+    #    而非本次提交的字段 diff，保证子级能拿到父级的所有字段值、缺失必填一次补齐
     sync_metadata_fields = {}
     if update_childs_main:
-        sync_metadata_fields = {
-            k: v for k, v in update_data.items()
-            if k not in _UPDATE_CHILDS_EXCLUDE and k != "genre_id"
-        }
-    
+        from sqlalchemy import inspect as sa_inspect
+        parent_meta = await metadata_repo.get_series_metadata_by_content_id(db, parent_id)
+        if parent_meta is None:
+            logger.warning("Update Childs 父级元数据不存在，跳过 Main 同步 | parent_id={}", parent_id)
+        else:
+            sync_metadata_fields = {
+                attr.key: getattr(parent_meta, attr.key)
+                for attr in sa_inspect(parent_meta).mapper.column_attrs
+                if attr.key not in _UPDATE_CHILDS_EXCLUDE and attr.key != "content_id"
+            }
+
     # 5. 递归同步到所有子级（各标签独立控制）
     synced_count = await _sync_recursive(
-        db, parent_id, sync_content_fields, sync_metadata_fields, 
+        db, parent_id, sync_content_fields, sync_metadata_fields,
         parent_custom_tag_ids, parent_field_values, parent_multilang_values, parent_i18n_metadata,
-        parent.title, update_childs_main, update_childs_custom_fields, update_childs_i18n
+        parent.title, update_childs_main, update_childs_custom_fields, update_childs_i18n,
+        processed_by=processed_by,
+        actor_id=actor_id,
+        ip_address=ip_address,
     )
     
     logger.info(
@@ -506,7 +596,10 @@ async def _sync_recursive(
     update_childs_main: bool = False,
     update_childs_custom_fields: bool = False,
     update_childs_i18n: bool = False,
-    depth: int = 0
+    depth: int = 0,
+    processed_by: str | None = None,
+    actor_id: int | None = None,
+    ip_address: str | None = None,
 ) -> int:
     """递归同步元数据到所有子级内容（各标签独立控制）。
     
@@ -556,8 +649,13 @@ async def _sync_recursive(
         
         # Main 标签：同步 content 主表字段 + 元数据表字段
         if update_childs_main:
-            # 1. 同步 content 主表字段（只同步 genre_id，不同步 title）
-            child.genre_id = sync_content_fields["genre_id"]
+            # 1. 同步 content_genre 中间表（父级覆盖子级策略）
+            parent_genre_ids = sync_content_fields.get("genre_ids", [])
+            await db.execute(
+                ContentGenre.__table__.delete().where(ContentGenre.content_id == child.id)
+            )
+            for gid in parent_genre_ids:
+                db.add(ContentGenre(content_id=child.id, genre_id=gid))
         
         # Custom Fields 标签：同步自定义标签 + 自定义字段
         if update_childs_custom_fields:
@@ -572,6 +670,7 @@ async def _sync_recursive(
             await _sync_i18n_metadata(db, child.id, parent_i18n_metadata)
         
         # Main 标签：同步元数据表字段
+        child_meta_synced = False
         if update_childs_main:
             child_type = child.content_type
             if child_type in ("MOVIE", "EPISODE"):
@@ -583,6 +682,7 @@ async def _sync_recursive(
                         if hasattr(child_meta, key):
                             setattr(child_meta, key, value)
                     synced_count += 1
+                    child_meta_synced = True
                     logger.info(
                         "Update Childs 同步 EPISODE | child_id={} synced_fields={}",
                         child.id, list(sync_metadata_fields_with_name.keys())
@@ -595,12 +695,18 @@ async def _sync_recursive(
                         content_id=child.id,
                         **{k: v for k, v in sync_metadata_fields_with_name.items() if v is not None}
                     )
-                    # 排除 genre_id 和 custom_tag_ids（它们在 content 主表和中间表，不在元数据表）
-                    metadata_dict = metadata_create.model_dump(exclude={'genre_id', 'custom_tag_ids'})
+                    # 排除 genre_ids 和 custom_tag_ids（它们在 content 主表和中间表，不在元数据表）
+                    metadata_dict = metadata_create.model_dump(exclude={'genre_ids', 'custom_tag_ids'})
+                    # 自动生成 CDR ID（如果未提供）
+                    if not metadata_dict.get("cdr_id") or metadata_dict.get("cdr_id") == "":
+                        metadata_dict["cdr_id"] = f"Program_{child.id}"
                     child_meta = ContentMetadata(**metadata_dict)
+                    # 系统维护字段：同步创建的单集为连续剧成员（0=VOD(MOVIE), 1=Series(EPISODE)）
+                    child_meta.series_flag = 1
                     db.add(child_meta)
                     synced_count += 1
-            elif child_type in ("SERIES", "SEASON"):
+                    child_meta_synced = True
+            elif child_type in ("SERIES", "SEASON_SERIES", "SEASON"):
                 # SERIES/SEASON 使用 series_metadata 表
                 child_meta = await metadata_repo.get_series_metadata_by_content_id(db, child.id)
                 if child_meta:
@@ -609,6 +715,7 @@ async def _sync_recursive(
                         if hasattr(child_meta, key):
                             setattr(child_meta, key, value)
                     synced_count += 1
+                    child_meta_synced = True
                     logger.info(
                         "Update Childs 同步 SERIES/SEASON | child_id={} synced_fields={}",
                         child.id, list(sync_metadata_fields_with_name.keys())
@@ -621,20 +728,85 @@ async def _sync_recursive(
                         content_id=child.id,
                         **{k: v for k, v in sync_metadata_fields_with_name.items() if v is not None}
                     )
-                    # 排除 genre_id 和 custom_tag_ids（它们在 content 主表和中间表，不在元数据表）
-                    metadata_dict = metadata_create.model_dump(exclude={'genre_id', 'custom_tag_ids'})
+                    # 排除 genre_ids 和 custom_tag_ids（它们在 content 主表和中间表，不在元数据表）
+                    metadata_dict = metadata_create.model_dump(exclude={'genre_ids', 'custom_tag_ids'})
+                    # 自动生成 CDR ID（如果未提供）
+                    if not metadata_dict.get("cdr_id") or metadata_dict.get("cdr_id") == "":
+                        metadata_dict["cdr_id"] = f"Series_{child.id}"
                     child_meta = SeriesMetadata(**metadata_dict)
+                    # 系统维护字段：按子级类型设置连续剧类型（1=SERIES, 2=单季, 3=总季），集/季数量初始化为 0
+                    child_meta.series_type = {"SERIES": 1, "SEASON_SERIES": 2, "SEASON": 3}.get(child_type)
+                    child_meta.volume_count = 0
                     db.add(child_meta)
                     synced_count += 1
+                    child_meta_synced = True
+        
+        # 同步完成后按真实必填完备性评估流程状态（check_metadata 判定元数据记录存在即 Passed，
+        # 与前端 Metadata 红绿勾口径一致）；skip_status_update 避免干扰下方子节点状态流转
+        if child_meta_synced:
+            await complete_process_and_update_status(
+                db,
+                content_id=child.id,
+                content_type=child.content_type,
+                process_name="Metadata",
+                processed_by=processed_by,
+                skip_status_update=True,
+                info="Update Childs 同步元数据",
+            )
+            # 活动日志：归属子级（content_id=child.id），保证单季/单集详情页 Activity Log 可见；
+            # 复用现有 PROGRAM/SERIES_METADATA_UPDATE 枚举，前端映射零改动
+            from app.internal.cms_biz_system.services.operation_log_service import write_log, OperationType
+            op_type = (
+                OperationType.PROGRAM_METADATA_UPDATE
+                if child.content_type in ("MOVIE", "EPISODE")
+                else OperationType.SERIES_METADATA_UPDATE
+            )
+            await write_log(
+                db,
+                user_id=actor_id,
+                user_name=processed_by,
+                operation_type=op_type,
+                operation_object_code="OBJ_CONTENT", operation_object_params={"name": child.title},
+                operation_content_code="log.metadata.sync",
+                operation_content_params={"title": parent_title},
+                content_id=child.id,
+                entity_type="content",
+                entity_id=child.id,
+                updated_value=f"由「{parent_title}」同步元数据",
+                ip_address=ip_address,
+                result="success",
+            )
         
         # 4. 递归同步子级的子级（传递标签控制开关）
         child_synced = await _sync_recursive(
             db, child.id, sync_content_fields, sync_metadata_fields,
             parent_custom_tag_ids, parent_field_values, parent_multilang_values, parent_i18n_metadata,
-            parent_title, update_childs_main, update_childs_custom_fields, update_childs_i18n, depth + 1
+            parent_title, update_childs_main, update_childs_custom_fields, update_childs_i18n,
+            depth + 1, processed_by=processed_by,
+            actor_id=actor_id,
+            ip_address=ip_address,
         )
         synced_count += child_synced
-    
+
+        # 5. 子内容状态为 None 时，根据素材情况决定新状态：
+        #    - 无素材 → WaitingForMaterials
+        #    - 有素材 → InProgress
+        #    其他状态（Published/ReadyForPublish 等）保持不变
+        if child.status == "None":
+            from app.internal.cms_biz_orchestration.services.content_status_service import ContentStatusService
+            should_waiting = await ContentStatusService.should_be_waiting_for_materials(
+                db, child.id, child.content_type
+            )
+            new_status = "WaitingForMaterials" if should_waiting else "InProgress"
+            child.status = new_status
+            await record_status_change(
+                db,
+                content_id=child.id,
+                before_status="None",
+                after_status=new_status,
+                processed_by=processed_by or "system",
+            )
+
     return synced_count
 
 
@@ -664,12 +836,27 @@ async def _sync_custom_fields(
         logger.info("Update Childs 父级无自定义字段，跳过同步 | child_id={}", content_id)
         return
     
+    # content_type 到 CustomFieldBelonging.belonging 的映射
+    # 统一转为小写比较，避免大小写和命名别名不一致
+    from sqlalchemy import func
+    _CONTENT_TYPE_TO_BELONGING: dict[str, list[str]] = {
+        "MOVIE": ["program", "movie"],
+        "EPISODE": ["program"],
+        "SERIES": ["series"],
+        "SEASON_SERIES": ["series"],
+        "SEASON": ["series"],
+        "CHANNEL": ["channel"],
+        "SCHEDULE": ["schedule"],
+    }
+    belonging_values = _CONTENT_TYPE_TO_BELONGING.get(content_type, [content_type.lower()])
+    belonging_values.append("all")
+    
     from app.internal.cms_biz_metada.models.basic import CustomFieldBelonging, CustomField
     
     # 1. 查询子级内容类型可用的自定义字段
     available_fields_result = await db.execute(
         select(CustomFieldBelonging.custom_field_id).where(
-            CustomFieldBelonging.belonging.in_([content_type, "ALL"]),
+            func.lower(CustomFieldBelonging.belonging).in_(belonging_values),
             CustomFieldBelonging.is_deleted.is_(False),
         )
     )
@@ -749,7 +936,7 @@ async def _sync_custom_fields(
                     select(EntityI18n).where(
                         EntityI18n.entity_type == "Content",
                         EntityI18n.entity_id == content_id,
-                        EntityI18n.field_name == f"cf_{field_code}",
+                        EntityI18n.field_name == field_code,
                         EntityI18n.is_deleted.is_(False),
                     )
                 )
@@ -764,7 +951,7 @@ async def _sync_custom_fields(
                         new_i18n = EntityI18n(
                             entity_type="Content",
                             entity_id=content_id,
-                            field_name=f"cf_{field_code}",
+                            field_name=field_code,
                             language=lang,
                             value=value,
                         )
@@ -841,6 +1028,11 @@ async def delete_series_metadata(db: AsyncSession, content_id: int) -> None:
     """软删除 Series 元数据。"""
     await metadata_repo.delete_series_metadata_by_content_id(db, content_id)
     logger.info("删除 Series 元数据 | content_id={}", content_id)
+    # 删除元数据属于节点数据变更，回退内容状态（已发布/准备发布等 → InProgress）
+    content = await _get_content_or_404(db, content_id)
+    await rollback_after_published_edit(
+        db, content_id, content.content_type, "system", "删除元数据"
+    )
 
 
 # ═══════════════════════════════════════════════════════════
@@ -885,13 +1077,14 @@ async def create_channel_metadata(
     await db.flush()
     await db.refresh(metadata)
 
-    # 完成 Metadata 流程节点并更新内容状态
+    # 用户主动创建元数据弹窗，直接记 Passed（用户确认即完成）
     await complete_process_and_update_status(
         db,
         content_id=data.content_id,
         content_type=content.content_type,
         process_name="Metadata",
         processed_by=processed_by,
+        record_status="Passed",
     )
 
     logger.info("创建 Channel 元数据 | content_id={}", data.content_id)
@@ -916,20 +1109,28 @@ async def update_channel_metadata(
     # )
 
     update_data = data.model_dump(exclude_unset=True)
+    # 在 setattr 前检测实际变更（inspect().modified 对同值赋值也返回 True）
+    has_metadata_changes = _has_real_changes(metadata, update_data)
     for key, value in update_data.items():
         setattr(metadata, key, value)
 
     await db.flush()
     await db.refresh(metadata)
 
-    # 完成 Metadata 流程节点并更新内容状态
     content = await _get_content_or_404(db, content_id)
+    await rollback_after_published_edit(db, content_id, content.content_type, processed_by or "system", "修改元数据")
+
+    # 用户主动保存元数据弹窗（含主表/自定义/多语言任一变更），每次都写一条 Passed 记录。
+    # 流程记录与状态判断解耦：保存即记录，状态固定 Passed（用户主动确认即完成），
+    # 不再以"主表是否有变更"或"是否已有 Passed 记录"作为是否写入的条件。
     await complete_process_and_update_status(
         db,
         content_id=content_id,
         content_type=content.content_type,
         process_name="Metadata",
         processed_by=processed_by,
+        record_status="Passed",
+        info="更新 Channel 元数据" if has_metadata_changes else "确认 Channel 元数据（仅自定义/多语言变更）",
     )
 
     logger.info("更新 Channel 元数据 | content_id={}", content_id)
@@ -941,6 +1142,11 @@ async def delete_channel_metadata(db: AsyncSession, content_id: int) -> None:
     """软删除 Channel 元数据。"""
     await metadata_repo.delete_channel_metadata_by_content_id(db, content_id)
     logger.info("删除 Channel 元数据 | content_id={}", content_id)
+    # 删除元数据属于节点数据变更，回退内容状态（已发布/准备发布等 → InProgress）
+    content = await _get_content_or_404(db, content_id)
+    await rollback_after_published_edit(
+        db, content_id, content.content_type, "system", "删除元数据"
+    )
 
 
 # ═══════════════════════════════════════════════════════════
@@ -979,6 +1185,9 @@ async def create_schedule_metadata(
     dump = data.model_dump()
     if not dump.get("name"):
         dump["name"] = content.title
+    # 自动生成 CDR ID: Schedule_{content_id}
+    if not dump.get("cdr_id") or dump.get("cdr_id") == "":
+        dump["cdr_id"] = f"Schedule_{data.content_id}"
 
     metadata = ScheduleMetadata(**dump)
     await metadata_repo.add_schedule_metadata(db, metadata)
@@ -989,13 +1198,14 @@ async def create_schedule_metadata(
     if data.cutv_enable is not None:
         content.cutv_enable = data.cutv_enable
 
-    # 完成 Metadata 流程节点并更新内容状态
+    # 用户主动创建元数据弹窗，直接记 Passed（用户确认即完成）
     await complete_process_and_update_status(
         db,
         content_id=data.content_id,
         content_type=content.content_type,
         process_name="Metadata",
         processed_by=processed_by,
+        record_status="Passed",
     )
 
     logger.info("创建 Schedule 元数据 | content_id={}", data.content_id)
@@ -1022,6 +1232,9 @@ async def update_schedule_metadata(
     # )
 
     update_data = data.model_dump(exclude_unset=True)
+
+    # 在 setattr 前检测实际变更（inspect().modified 对同值赋值也返回 True）
+    has_metadata_changes = _has_real_changes(metadata, update_data)
     for key, value in update_data.items():
         setattr(metadata, key, value)
 
@@ -1037,13 +1250,20 @@ async def update_schedule_metadata(
     await db.flush()
     await db.refresh(metadata)
 
-    # 完成 Metadata 流程节点并更新内容状态
+    if content.status == "Published":
+        await rollback_after_published_edit(db, content_id, content.content_type, processed_by or "system", "修改元数据")
+
+    # 用户主动保存元数据弹窗（含主表/自定义/多语言任一变更），每次都写一条 Passed 记录。
+    # 流程记录与状态判断解耦：保存即记录，状态固定 Passed（用户主动确认即完成），
+    # 不再以"主表是否有变更"或"是否已有 Passed 记录"作为是否写入的条件。
     await complete_process_and_update_status(
         db,
         content_id=content_id,
         content_type=content.content_type,
         process_name="Metadata",
         processed_by=processed_by,
+        record_status="Passed",
+        info="更新 Schedule 元数据" if has_metadata_changes else "确认 Schedule 元数据（仅自定义/多语言变更）",
     )
 
     logger.info("更新 Schedule 元数据 | content_id={}", content_id)
@@ -1055,6 +1275,11 @@ async def delete_schedule_metadata(db: AsyncSession, content_id: int) -> None:
     """软删除 Schedule 元数据。"""
     await metadata_repo.delete_schedule_metadata_by_content_id(db, content_id)
     logger.info("删除 Schedule 元数据 | content_id={}", content_id)
+    # 删除元数据属于节点数据变更，回退内容状态（已发布/准备发布等 → InProgress）
+    content = await _get_content_or_404(db, content_id)
+    await rollback_after_published_edit(
+        db, content_id, content.content_type, "system", "删除元数据"
+    )
 
 
 # ═══════════════════════════════════════════════════════════
@@ -1079,7 +1304,7 @@ async def get_metadata_detail(db: AsyncSession, content_id: int) -> MetadataDeta
 
     if content_type in ("MOVIE", "EPISODE"):
         result.program = await get_content_metadata(db, content_id)
-    elif content_type in ("SERIES", "SEASON"):
+    elif content_type in ("SERIES", "SEASON", "SEASON_SERIES"):
         result.series = await get_series_metadata(db, content_id)
     elif content_type == "CHANNEL":
         result.channel = await get_channel_metadata(db, content_id)

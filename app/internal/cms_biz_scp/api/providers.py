@@ -69,8 +69,8 @@ async def create_provider_api(
         user_id=current_user.id,
         user_name=current_user.username,
         operation_type=OperationType.PROVIDER_CREATE,
-        operation_object=f"PROVIDER {body.name}",
-        operation_content="LOG_PROVIDER_CREATED",
+        operation_object_code="OBJ_PROVIDER", operation_object_params={"name": body.name},
+        operation_content_code="LOG_PROVIDER_CREATE", operation_content_params={"name": body.name},
         previous_value=previous_value,
         updated_value=updated_value,
         updated_value_json=updated_value_json,
@@ -90,18 +90,23 @@ async def batch_delete_providers_api(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    rows = (await db.execute(select(Provider.name).where(Provider.id.in_(body.ids), Provider.is_deleted.is_(False)))).scalars().all()
-    provider_names = ", ".join(rows) if rows else str(body.ids)
+    providers = (await db.execute(select(Provider).where(Provider.id.in_(body.ids), Provider.is_deleted.is_(False)))).scalars().all()
+    provider_names = ", ".join([p.name for p in providers]) if providers else str(body.ids)
+    prev_data = [orm_to_dict(p) for p in providers]
+    prev_val, _, raw_val = await prepare_log_values(db, "provider", prev_data, None)
     deleted = await provider_service.batch_delete_providers(db, body)
     await write_log(
         db,
         user_id=current_user.id,
         user_name=current_user.username,
         operation_type=OperationType.PROVIDER_BATCH_DELETE,
-        operation_object=f"供应商 {provider_names}",
-        operation_content=f"批量删除供应商: {provider_names}",
+        operation_object_code="OBJ_PROVIDER", operation_object_params={"name": provider_names},
+        operation_content_code="LOG_PROVIDER_BATCH_DELETE", operation_content_params={"names": provider_names},
         entity_type="provider",
         entity_id=body.ids[0] if body.ids else None,
+        previous_value=prev_val,
+        updated_value=None,
+        updated_value_json=raw_val,
         ip_address=_get_ip(request),
         result="success",
     )
@@ -144,8 +149,8 @@ async def update_provider_api(
         user_id=current_user.id,
         user_name=current_user.username,
         operation_type=OperationType.PROVIDER_EDIT,
-        operation_object=f"PROVIDER {old.name}",
-        operation_content="LOG_PROVIDER_UPDATED",
+        operation_object_code="OBJ_PROVIDER", operation_object_params={"name": old.name},
+        operation_content_code="LOG_PROVIDER_EDIT", operation_content_params={"name": old.name},
         previous_value=previous_value,
         updated_value=updated_value,
         updated_value_json=updated_value_json,
@@ -175,8 +180,8 @@ async def delete_provider_api(
         user_id=current_user.id,
         user_name=current_user.username,
         operation_type=OperationType.PROVIDER_DELETE,
-        operation_object=f"PROVIDER {provider_name}",
-        operation_content="LOG_PROVIDER_DELETED",
+        operation_object_code="OBJ_PROVIDER", operation_object_params={"name": provider_name},
+        operation_content_code="LOG_PROVIDER_DELETE", operation_content_params={"name": provider_name},
         previous_value=previous_value,
         updated_value=updated_value,
         updated_value_json=updated_value_json,

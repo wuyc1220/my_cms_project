@@ -139,7 +139,7 @@ class PosterSizeCreate(BaseModel):
     width: int = -1
     height: int = -1
     max_file_size_kb: int = -1
-    mapping_type: int = Field(..., description="C2规范生成mappings时需要传入的Mapping type值")
+    mapping_type: int = Field(..., description="Mapping type value for C2 mappings generation")
     mandatory: bool = False
 
     @field_validator("width", "height", "max_file_size_kb")
