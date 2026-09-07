@@ -47,10 +47,15 @@ class SOAPSettings(BaseSettings):
 
     # SOAP 请求超时时间（秒）
     timeout: int = 30
-    
+
     # 重试配置
     max_retries: int = 3
     retry_delay: int = 5  # 秒
+
+    # SSRF 防护：允许访问私网/保留地址段的结果文件 URL 白名单
+    # 逗号分隔的 hostname 或 CIDR（如 "192.168.10.0/24,lsp-internal.com"）
+    # 白名单优先于私网拦截；未配置时一律拒绝私网地址
+    result_url_private_allowlist: str = ""
     
     class Config:
         env_file = ".env"
@@ -80,6 +85,9 @@ async def load_soap_config_from_db(db) -> None:
         soap_settings.csp_id = await get_config_value(db, "SOAP_CSP_ID", default_value=soap_settings.csp_id)
         soap_settings.lsp_id = await get_config_value(db, "SOAP_LSP_ID", default_value=soap_settings.lsp_id)
         soap_settings.lsp_soap_url = await get_config_value(db, "SOAP_LSP_SOAP_URL", default_value=soap_settings.lsp_soap_url)
+        soap_settings.result_url_private_allowlist = await get_config_value(
+            db, "SOAP_RESULT_URL_PRIVATE_ALLOWLIST", default_value=soap_settings.result_url_private_allowlist
+        )
         
         # 加载整数配置
         soap_settings.timeout = await get_config_int(db, "SOAP_TIMEOUT", default_value=soap_settings.timeout)

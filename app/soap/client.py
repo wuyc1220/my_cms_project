@@ -1,6 +1,7 @@
 """SOAP 客户端实现 - 直接发送原始 XML"""
 import uuid
-import xml.etree.ElementTree as ET
+# defusedxml：解析 LSP 返回的不可信 XML 时禁用实体/DTD，防 XML 炸弹（billion laughs）DoS
+from defusedxml import ElementTree as ET
 from typing import Dict, Any, Optional
 from loguru import logger
 import requests

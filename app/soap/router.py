@@ -10,7 +10,9 @@ PublishTask 和 IngestHistory，更新业务状态。
 import httpx
 from datetime import datetime, timezone
 from pathlib import Path
-from xml.etree import ElementTree as ET
+
+# defusedxml：解析不可信 XML（LSP 回调报文）时禁用实体/DTD，防 XML 炸弹（billion laughs）DoS
+from defusedxml import ElementTree as ET
 
 from fastapi import APIRouter, Depends, Request, Response
 from pydantic import BaseModel, Field
@@ -20,6 +22,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.common.dependencies import get_db
 from app.common.core.i18n import get_msg
+from app.common.core.exceptions import BusinessException, ErrorCode
 from app.internal.cms_biz_publish.repositories import publish_repository
 
 router = APIRouter(prefix="/soap", tags=["SOAP Content Distribution"])
@@ -84,10 +87,16 @@ async def receive_result_notify(
         await db.commit()
 
         return result
-    except Exception as e:
-        logger.error(get_msg("SOAP_PROCESS_NOTIFY_FAILED", id=request.CorrelateID, error=str(e)))
+    except BusinessException as e:
+        # 受控业务错误：message 为 i18n 文案，可放入 ErrorDescription 返回 LSP
+        logger.error(f"处理结果通知失败 - CorrelateID: {request.CorrelateID}, 错误: {e}")
         await db.rollback()
-        return ResultNotifyRes(Result=-1, ErrorDescription=get_msg("SOAP_PROCESS_NOTIFY_FAILED", id=request.CorrelateID, error=str(e)))
+        return ResultNotifyRes(Result=-1, ErrorDescription=e.message)
+    except Exception as e:
+        # 非预期异常不对外暴露细节（防异常信息泄露），完整信息仅记录服务端日志
+        logger.error(f"处理结果通知失败 - CorrelateID: {request.CorrelateID}, 错误: {e}")
+        await db.rollback()
+        return ResultNotifyRes(Result=-1, ErrorDescription=get_msg("INTERNAL_ERROR"))
 
 
 @router.post("/result-notify-xml")
@@ -165,10 +174,20 @@ async def receive_result_notify_xml(
             media_type="text/xml",
         )
 
-    except Exception as e:
+    except BusinessException as e:
+        # 受控业务错误：message 为 i18n 文案，可放入 ErrorDescription 返回 LSP
         logger.error(f"处理 SOAP XML 结果通知失败: {e}")
         await db.rollback()
-        soap_response = _build_soap_response(-1, str(e))
+        soap_response = _build_soap_response(-1, e.message)
+        return Response(
+            content=soap_response,
+            media_type="text/xml",
+        )
+    except Exception as e:
+        # 非预期异常不对外暴露细节（防异常信息泄露），完整信息仅记录服务端日志
+        logger.error(f"处理 SOAP XML 结果通知失败: {e}")
+        await db.rollback()
+        soap_response = _build_soap_response(-1, get_msg("INTERNAL_ERROR"))
         return Response(
             content=soap_response,
             media_type="text/xml",
@@ -201,8 +220,9 @@ async def receive_exec_cmd_response(
         return ExecCmdRes(Result=0, ErrorDescription=None)
 
     except Exception as e:
+        # 非预期异常不对外暴露细节（防异常信息泄露），完整信息仅记录服务端日志
         logger.error("ExecCmdRes processing failed: {}", e)
-        return ExecCmdRes(Result=-1, ErrorDescription=get_msg("SOAP_PROCESS_NOTIFY_FAILED", error=str(e)))
+        return ExecCmdRes(Result=-1, ErrorDescription=get_msg("INTERNAL_ERROR"))
 
 
 # ═══════════════════════════════════════════════════════════
@@ -543,13 +563,23 @@ async def _process_result_notify(
             result_xml_path = await _download_result_xml(
                 result_file_url, correlate_id
             )
-        except Exception as e:
-            download_error = str(e)
+        except BusinessException as e:
+            # 受控业务错误：message 为 i18n 文案，可安全放入 ErrorDescription 返回 LSP
+            download_error = e.message
             logger.error(
                 f"Result XML 下载失败 - URL: {result_file_url}, "
-                f"Error: {download_error}"
+                f"Error: {e}"
             )
-            # 下载失败原因记录到数据库
+        except Exception as e:
+            # 非预期异常不对外暴露细节（防异常信息泄露），完整信息仅记录服务端日志
+            download_error = get_msg("INTERNAL_ERROR")
+            logger.error(
+                f"Result XML 下载失败 - URL: {result_file_url}, "
+                f"Error: {e}"
+            )
+
+        # 下载失败原因记录到数据库
+        if download_error:
             if history:
                 history.soap_error_description = download_error
             task.error_message = (task.error_message or "") + f"; 下载失败: {download_error}"
@@ -601,7 +631,7 @@ def _parse_soap_result_notify(xml_str: str) -> tuple:
     # 按本地名称查找 ResultNotify / ResultNotifyReq 节点（忽略命名空间前缀）
     req_element = _find_by_local_name(root, "ResultNotify") or _find_by_local_name(root, "ResultNotifyReq")
     if req_element is None:
-        raise ValueError(get_msg("SOAP_PARSE_ROOT_NOT_FOUND", tag=root.tag))
+        raise BusinessException(ErrorCode.SOAP_PARSE_ROOT_NOT_FOUND, get_msg("SOAP_PARSE_ROOT_NOT_FOUND", tag=root.tag))
 
     def _get_text(element, tag: str) -> str:
         child = _find_by_local_name(element, tag)
@@ -616,7 +646,7 @@ def _parse_soap_result_notify(xml_str: str) -> tuple:
     result_file_url = _get_text(req_element, "ResultFileURL") or None
 
     if not correlate_id:
-        raise ValueError(get_msg("SOAP_CORRELATE_ID_REQUIRED"))
+        raise BusinessException(ErrorCode.SOAP_CORRELATE_ID_REQUIRED, get_msg("SOAP_CORRELATE_ID_REQUIRED"))
 
     try:
         cmd_result = int(cmd_result_str)
@@ -653,6 +683,54 @@ def _build_soap_response(result: int, error_description: Optional[str] = None) -
 # 内部辅助方法
 # ═══════════════════════════════════════════════════════════
 
+def _validate_result_url_host(parsed) -> None:
+    """
+    SSRF 防护：校验结果文件 URL 的目标地址，禁止指向私网/保留网段。
+
+    - 解析 hostname 的全部 IP（防 DNS Rebinding 到内网）
+    - 拒绝环回/私网/链路本地（含云元数据 169.254.169.254）/保留/多播地址
+    - 白名单（SOAP_RESULT_URL_PRIVATE_ALLOWLIST，逗号分隔 hostname 或 CIDR）优先于拦截
+
+    Raises:
+        Exception: 目标地址不允许访问时抛出（由调用方捕获后放入 ErrorDescription）
+    """
+    import ipaddress
+    import socket
+
+    from .config import soap_settings
+
+    hostname = parsed.hostname
+    if not hostname:
+        raise BusinessException(ErrorCode.SOAP_RESULT_URL_FORBIDDEN, get_msg("SOAP_RESULT_URL_FORBIDDEN", url=parsed.geturl()))
+
+    # 白名单：hostname 精确匹配（大小写不敏感）
+    allowlist = [item.strip() for item in soap_settings.result_url_private_allowlist.split(",") if item.strip()]
+    if hostname.lower() in (item.lower() for item in allowlist):
+        return
+
+    # 解析 hostname 的全部 IP
+    try:
+        addr_infos = socket.getaddrinfo(hostname, None)
+        ips = [ipaddress.ip_address(info[4][0]) for info in addr_infos]
+    except (socket.gaierror, ValueError) as e:
+        raise BusinessException(ErrorCode.SOAP_RESULT_URL_FORBIDDEN, get_msg("SOAP_RESULT_URL_FORBIDDEN", url=parsed.geturl())) from e
+
+    # 白名单：CIDR 网段匹配
+    allow_networks = []
+    for item in allowlist:
+        try:
+            allow_networks.append(ipaddress.ip_network(item, strict=False))
+        except ValueError:
+            continue  # 非法 CIDR 忽略（hostname 白名单已在上面处理）
+
+    for ip in ips:
+        if any(ip in network for network in allow_networks):
+            continue
+        # 多播地址（224.0.0.0/4）在 Python 语义中 is_global=True，需显式拦截
+        if not ip.is_global or ip.is_multicast:
+            raise BusinessException(ErrorCode.SOAP_RESULT_URL_FORBIDDEN, get_msg("SOAP_RESULT_URL_FORBIDDEN", url=parsed.geturl()))
+
+
 async def _download_result_xml(result_file_url: str, correlate_id: str) -> Optional[str]:
     """
     从 LSP 下载 Result XML 文件，上传到 SFTP 的 soap 目录。
@@ -663,7 +741,8 @@ async def _download_result_xml(result_file_url: str, correlate_id: str) -> Optio
         上传后的相对路径；不支持的协议返回 None
 
     Raises:
-        Exception: 下载或上传失败时抛出异常（由调用方捕获后放入 ErrorDescription 返回给 LSP）
+        BusinessException: 下载或上传失败时抛出（message 为 i18n 受控文案，
+            由调用方捕获后放入 ErrorDescription 返回 LSP）
     """
     import asyncio
 
@@ -673,6 +752,10 @@ async def _download_result_xml(result_file_url: str, correlate_id: str) -> Optio
 
     parsed = urlparse(result_file_url)
     content: bytes
+
+    # SSRF 防护：sftp/ftp/http/https 四个分支统一校验目标地址（DNS 解析放线程池，避免阻塞事件循环）
+    if parsed.scheme in ("http", "https", "sftp", "ftp"):
+        await asyncio.to_thread(_validate_result_url_host, parsed)
 
     if parsed.scheme == "sftp":
         host = parsed.hostname or ""
@@ -693,7 +776,9 @@ async def _download_result_xml(result_file_url: str, correlate_id: str) -> Optio
                 soap_settings.timeout,
             )
         except Exception as e:
-            raise Exception(get_msg("SOAP_SFTP_DOWNLOAD_FAILED", error=str(e))) from e
+            # 完整异常仅记录服务端日志，不随对外消息返回（防异常信息泄露）
+            logger.error(f"SFTP 下载 Result XML 失败 - CorrelateID: {correlate_id}, Error: {e}")
+            raise BusinessException(ErrorCode.SOAP_SFTP_DOWNLOAD_FAILED, get_msg("SOAP_SFTP_DOWNLOAD_FAILED")) from e
 
     elif parsed.scheme == "ftp":
         host = parsed.hostname or ""
@@ -714,7 +799,9 @@ async def _download_result_xml(result_file_url: str, correlate_id: str) -> Optio
                 soap_settings.timeout,
             )
         except Exception as e:
-            raise Exception(get_msg("SOAP_FTP_DOWNLOAD_FAILED", error=str(e))) from e
+            # 完整异常仅记录服务端日志，不随对外消息返回（防异常信息泄露）
+            logger.error(f"FTP 下载 Result XML 失败 - CorrelateID: {correlate_id}, Error: {e}")
+            raise BusinessException(ErrorCode.SOAP_FTP_DOWNLOAD_FAILED, get_msg("SOAP_FTP_DOWNLOAD_FAILED")) from e
 
     elif parsed.scheme in ("http", "https"):
         import httpx
@@ -724,7 +811,9 @@ async def _download_result_xml(result_file_url: str, correlate_id: str) -> Optio
                 response.raise_for_status()
                 content = response.content
         except Exception as e:
-            raise Exception(get_msg("SOAP_HTTP_DOWNLOAD_FAILED", error=str(e))) from e
+            # 完整异常仅记录服务端日志，不随对外消息返回（防异常信息泄露）
+            logger.error(f"HTTP 下载 Result XML 失败 - CorrelateID: {correlate_id}, Error: {e}")
+            raise BusinessException(ErrorCode.SOAP_HTTP_DOWNLOAD_FAILED, get_msg("SOAP_HTTP_DOWNLOAD_FAILED")) from e
     else:
         logger.warning(
             get_msg("SOAP_UNSUPPORTED_PROTOCOL", scheme=parsed.scheme),
@@ -739,7 +828,9 @@ async def _download_result_xml(result_file_url: str, correlate_id: str) -> Optio
             content, filename, "soap",
         )
     except Exception as e:
-        raise Exception(get_msg("SOAP_RESULT_XML_UPLOAD_FAILED", error=str(e))) from e
+        # 完整异常仅记录服务端日志，不随对外消息返回（防异常信息泄露）
+        logger.error(f"Result XML 上传到 SFTP 失败 - CorrelateID: {correlate_id}, Error: {e}")
+        raise BusinessException(ErrorCode.SOAP_RESULT_XML_UPLOAD_FAILED, get_msg("SOAP_RESULT_XML_UPLOAD_FAILED")) from e
 
     logger.info(f"Result XML 已上传至 SFTP: {result['file_path']}, 大小: {result['file_size']} bytes")
     return result["file_path"]
