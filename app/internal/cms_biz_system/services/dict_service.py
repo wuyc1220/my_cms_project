@@ -17,6 +17,22 @@ from app.common.core.exceptions import ErrorCode, BusinessException
 _dict_tree_cache: dict = {}
 _DICT_TREE_CACHE_TTL = 300
 
+# 字典子节点内存缓存（key=根节点 code，TTL 兜底，正常靠写操作后主动失效）
+# get_dict_children_by_code 全后端 20+ 处调用（详情页一次加载可能触发几十条字典 SQL），
+# 字典数据变化极少，缓存后单次调用从 2 条串行 SQL 降为 0
+_dict_children_cache: dict[str, tuple[float, list[LanguageOption]]] = {}
+_DICT_CHILDREN_CACHE_TTL = 300
+
+
+def _invalidate_dict_caches() -> None:
+    """字典写操作（增/改/删/状态切换）提交后调用，清空字典相关内存缓存。
+
+    在 API 层 db.commit() 之后调用，保证数据先落库再清缓存，
+    避免并发请求用旧数据回填缓存。
+    """
+    _dict_tree_cache.clear()
+    _dict_children_cache.clear()
+
 
 async def _fix_sequence(db: AsyncSession, table_name: str, sequence_name: str) -> None:
     result = await db.execute(text(f"SELECT MAX(id) FROM {table_name}"))
@@ -26,7 +42,6 @@ async def _fix_sequence(db: AsyncSession, table_name: str, sequence_name: str) -
 
 
 async def get_node(db: AsyncSession, node_id: int) -> DictNode:
-    logger.info(f"get_node 入参: node_id={node_id}")
     result = await db.execute(
         select(DictNode)
         .where(DictNode.id == node_id, DictNode.is_deleted == False)
@@ -149,12 +164,10 @@ async def get_tree(
     if use_cache:
         now = time.time()
         if _dict_tree_cache and _dict_tree_cache.get("expires", 0) > now:
-            logger.info("get_tree 命中内存缓存")
             return [DictNodeListItem.model_validate(item) for item in _dict_tree_cache["data"]]
 
     # 过滤掉已逻辑删除的节点（status='deleted' 或 is_deleted=True），仅返回可见数据
     query = select(DictNode).where(DictNode.status != "deleted", DictNode.is_deleted == False)
-    logger.info(f"get_tree 入参: name={name}, code={code}, remark={remark}, sort_by={sort_by}, sort_order={sort_order}")
 
     # 动态排序
     if sort_by and sort_order:
@@ -180,30 +193,23 @@ async def get_tree(
 
 
 async def get_multi_language_options(db: AsyncSession) -> list[LanguageOption]:
-    logger.info(f"get_multi_language_options 入参: 无")
-    root = (
-        await db.execute(
-            select(DictNode).where(DictNode.parent_id.is_(None), DictNode.code == "Multi_Languages", DictNode.is_deleted == False)
-        )
-    ).scalar_one_or_none()
-    if root is None:
-        return []
-
-    children = (
-        await db.execute(
-            select(DictNode)
-            .where(DictNode.parent_id == root.id, DictNode.status == "active", DictNode.is_deleted == False)
-            .order_by(DictNode.sort_order, DictNode.id)
-        )
-    ).scalars().all()
-    return [LanguageOption(code=item.code, name=item.name) for item in children]
+    # 与 get_dict_children_by_code("Multi_Languages") 逻辑一致，复用以获得内存缓存
+    return await get_dict_children_by_code(db, "Multi_Languages")
 
 
 async def get_dict_children_by_code(db: AsyncSession, code: str) -> list[LanguageOption]:
     """
     根据根节点 code 获取其所有活跃子节点，返回 LanguageOption 列表。
+
+    带内存缓存（TTL 兜底）；字典写操作提交后由 _invalidate_dict_caches 主动清空，
+    正常路径不会读到过期数据。返回列表浅拷贝，防止调用方增删元素污染缓存
+    （元素本身仅被只读使用）。
     """
-    logger.info(f"get_dict_children_by_code 入参: code={code}")
+    now = time.time()
+    cached = _dict_children_cache.get(code)
+    if cached is not None and cached[0] > now:
+        return list(cached[1])
+
     root = (
         await db.execute(
             select(DictNode).where(DictNode.parent_id.is_(None), DictNode.code == code, DictNode.is_deleted == False)
@@ -219,11 +225,12 @@ async def get_dict_children_by_code(db: AsyncSession, code: str) -> list[Languag
             .order_by(DictNode.sort_order, DictNode.id)
         )
     ).scalars().all()
-    return [LanguageOption(code=item.code, name=item.name) for item in children]
+    result = [LanguageOption(code=item.code, name=item.name) for item in children]
+    _dict_children_cache[code] = (time.time() + _DICT_CHILDREN_CACHE_TTL, result)
+    return list(result)
 
 
 async def create_node(db: AsyncSession, data: DictNodeCreate) -> DictNode:
-    logger.info(f"create_node 入参: data={data}")
     if data.parent_id is not None:
         await get_node(db, data.parent_id)
     node_code = (data.code or "").strip() or uuid.uuid4().hex[:8].upper()
@@ -255,7 +262,6 @@ async def create_node(db: AsyncSession, data: DictNodeCreate) -> DictNode:
 
 async def update_node(db: AsyncSession, node_id: int, data: DictNodeUpdate) -> DictNodeListItem:
     node = await get_node(db, node_id)
-    logger.info(f"update_node 入参: node_id={node_id}, data={data}")
     if data.name is not None and data.name != node.name:
         await _ensure_unique_name(db, node.parent_id, data.name, exclude_id=node_id)
         node.name = data.name
@@ -284,7 +290,6 @@ async def toggle_status(db: AsyncSession, node_id: int, new_status: str) -> Dict
       - 系统内置节点不允许删除
       - 级联将所有子节点状态也设为 'deleted' 且 is_deleted=True
     """
-    logger.info(f"toggle_status 入参: node_id={node_id}, new_status={new_status}")
     node = await get_node(db, node_id)
     if new_status == "deleted":
         if node.is_system:
@@ -305,7 +310,6 @@ async def toggle_status(db: AsyncSession, node_id: int, new_status: str) -> Dict
 
 async def delete_node(db: AsyncSession, node_id: int) -> None:
     node = await get_node(db, node_id)
-    logger.info(f"delete_node 入参: node_id={node_id}")
     if node.is_system:
         raise BusinessException(ErrorCode.SYSTEM_DICT_CANNOT_DELETE, get_msg("SYSTEM_DICT_CANNOT_DELETE"))
     descendant_ids = await _collect_descendant_ids(db, node.id)

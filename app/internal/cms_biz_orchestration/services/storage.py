@@ -459,67 +459,110 @@ class StorageService:
     def get_file(self, file_path: str) -> bytes:
         """
         读取文件内容。
-        
+
         支持三种输入，每种使用正确的读取方式：
         1. 完整URL（sftp://xxx 或 ftp://xxx）→ 从URL指定的服务器直接下载（不依赖当前配置）
         2. 相对路径（pictures/xxx.jpg）→ 用当前storage_service配置读取
         3. 加密URL → 先解密再按规则1或2处理
-        
+
         这样即使以后换了FTP服务器，存着旧服务器URL的数据也能正确读取。
         """
         # 先解密（兼容：未加密的直接原样返回）
         resolved_path = decrypt_storage_url(file_path)
         
         # 如果是完整URL，从URL指向的服务器下载（用URL自身的连接信息）
-        if resolved_path.startswith(("sftp://", "ftp://")):
+        if resolved_path.startswith(("sftp://", "ftp://", "http://", "https://")):
             return self._download_from_url(resolved_path)
-        
+
         # 如果是相对路径，用当前配置的backend读取
         return self.backend.get_file(resolved_path)
+
+    def _mask_url_password(self, url: str) -> str:
+        """将 URL 中的密码部分替换为 ***，避免日志泄露。"""
+        from urllib.parse import urlparse, urlunparse
+
+        parsed = urlparse(url)
+        if parsed.password is None:
+            return url
+        # 用占位密码替换真实密码
+        netloc = f"{parsed.username}:***@{parsed.hostname}"
+        if parsed.port is not None:
+            netloc += f":{parsed.port}"
+        return urlunparse((parsed.scheme, netloc, parsed.path, parsed.params, parsed.query, parsed.fragment))
 
     def _download_from_url(self, url: str) -> bytes:
         """
         从完整URL直接下载文件，使用URL中的连接信息，不依赖当前配置。
-        
+
         这样即使以后换了FTP服务器，存着旧URL的数据也能从正确的服务器读取。
         """
         from urllib.parse import urlparse
-        
+
         parsed = urlparse(url)
         host = parsed.hostname or ""
         port = parsed.port or (22 if parsed.scheme == "sftp" else 21)
         username = parsed.username or ""
         password = parsed.password or ""
         remote_path = parsed.path or ""
-        
-        logger.debug(f"从URL直接下载文件 - {parsed.scheme}://{host}:{port}{remote_path}")
-        
+        # SFTP 路径归一化：确保以单个 / 开头（兼容 //cms/... 这类双斜杠写法）
+        if remote_path:
+            remote_path = "/" + remote_path.lstrip("/")
+
         if parsed.scheme == "sftp":
             import paramiko
             transport = paramiko.Transport((host, port))
-            transport.connect(username=username, password=password)
             try:
+                transport.connect(username=username, password=password)
                 client = paramiko.SFTPClient.from_transport(transport)
                 try:
                     with client.file(remote_path, "rb") as f:
                         return f.read()
                 finally:
                     client.close()
+            except Exception as e:
+                logger.error(
+                    f"[_download_from_url] SFTP 下载失败: host={host}, port={port}, "
+                    f"username={username}, remote_path={remote_path}, error={e}"
+                )
+                raise
             finally:
                 transport.close()
-        
+
         elif parsed.scheme == "ftp":
             from ftplib import FTP
             ftp = FTP()
-            ftp.connect(host, port)
-            ftp.login(username, password)
             try:
+                ftp.connect(host, port)
+                ftp.login(username, password)
                 file_obj = BytesIO()
                 ftp.retrbinary(f"RETR {remote_path}", file_obj.write)
                 return file_obj.getvalue()
+            except Exception as e:
+                logger.error(
+                    f"[_download_from_url] FTP 下载失败: host={host}, port={port}, "
+                    f"username={username}, remote_path={remote_path}, error={e}"
+                )
+                raise
             finally:
                 ftp.quit()
-        
+
+        elif parsed.scheme in ("http", "https"):
+            import base64
+            import urllib.request
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            # URL 中带 user:password 时使用 HTTP Basic Auth
+            if username and password:
+                cred = base64.b64encode(f"{username}:{password}".encode()).decode()
+                req.add_header("Authorization", f"Basic {cred}")
+            try:
+                with urllib.request.urlopen(req, timeout=120) as resp:
+                    return resp.read()
+            except Exception as e:
+                logger.error(
+                    f"[_download_from_url] HTTP 下载失败: url={self._mask_url_password(url)}, error={e}"
+                )
+                raise
+
         else:
             raise ValueError(get_msg("STORAGE_DOWNLOAD_UNSUPPORTED", scheme=parsed.scheme))
     

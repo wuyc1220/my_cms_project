@@ -13,7 +13,7 @@ import asyncio
 import mimetypes
 import os
 import re
-from urllib.parse import quote, unquote
+from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, File, Query, UploadFile, status
 from loguru import logger
@@ -159,21 +159,22 @@ async def download_attachment(
     - inline=true:以内联形式返回文件内容,浏览器可直接展示图片等媒体。
     - 不需要认证,方便在 <img> 等标签中直接引用。
     """
-    # 处理URL编码:axios的params会自动编码,需要解码
-    decoded_path = unquote(path)
+    # 注意：不要对 path 再做 unquote——FastAPI 已对 query 参数解码过一次，
+    # 前端传参时也只编码一次。二次解码会把加密串里的 %2B(+)/%2F(/) 破坏，
+    # 导致解密失败、被误判为本地相对路径而 404。
+    decoded_path = path
 
-    # 判断是否为外部FTP/SFTP的加密URL（解密后是完整URL）
+    # 判断是否为外部FTP/SFTP/HTTP的完整URL（解密后是完整URL）
     resolved = decrypt_storage_url(decoded_path)
-    if resolved.startswith(("sftp://", "ftp://")):
-        # 外部FTP场景：直接使用解密后的完整URL下载
+    if resolved.startswith(("sftp://", "ftp://", "http://", "https://")):
+        # 外部URL场景：直接使用解密后的完整URL下载
         file_path = decoded_path
-        filename = resolved.rsplit("/", 1)[-1]
+        # 文件名取URL最后一段，去掉可能的查询参数
+        filename = resolved.rsplit("/", 1)[-1].split("?")[0] or "download"
     else:
         # 本地上传场景：转换为相对路径
         file_path = storage_service._to_relative_path(decoded_path)
         filename = file_path.rsplit("/", 1)[-1]
-
-    logger.debug(f"下载文件 - 原始path: {path[:100]}..., 解密后: {resolved[:100]}..., 使用路径: {file_path}")
 
     # 获取正确的 MIME 类型
     media_type, _ = mimetypes.guess_type(filename)

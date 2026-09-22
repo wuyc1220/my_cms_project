@@ -5,7 +5,7 @@
 """
 import asyncio
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from loguru import logger
@@ -195,6 +195,7 @@ async def create_publish_plan(
     processed_by: Optional[str] = None,
     _skip_parent_republish: bool = False,
     _skip_cascade_children: bool = False,
+    _skip_parent_validation: bool = False,
 ) -> PublishPlanResponse:
     """创建或更新发布/下架计划
 
@@ -203,6 +204,11 @@ async def create_publish_plan(
                                 防止子→父→子→父 死循环
         _skip_cascade_children: 内部参数，父级重新发布时传 True，
                                 防止父级级联发布刚触发的子内容（避免重复发布）
+        _skip_parent_validation: 内部参数，级联创建子内容计划时传 True，
+                                跳过"父级必须已发布"校验——计划发布的级联
+                                发生在父级发布之前（父级任务为 plan 状态），
+                                发布顺序由子级时间 +1s 逐级错开与定时执行时
+                                的父级状态守卫（is_parent_publish_ready）保证
     """
     logger.info(
         f"[创建发布计划] entity_type={data.entity_type}, entity_id={data.entity_id}, "
@@ -248,7 +254,14 @@ async def create_publish_plan(
             )
 
     # 发布子内容时，校验父内容的发布状态
-    if data.task_type == "publish" and data.entity_type == "Content" and data.content_type:
+    # 级联路径跳过（_skip_parent_validation）：计划发布的级联发生在父级发布之前，
+    # 父级任务此时为 plan 状态（非 publishing）会被校验拦截，导致子级计划静默创建失败
+    if (
+        data.task_type == "publish"
+        and data.entity_type == "Content"
+        and data.content_type
+        and not _skip_parent_validation
+    ):
         await _validate_parent_published(db, data.content_type, data.entity_id)
 
     # 获取现有任务（加行级锁，防止并发更新同一条记录导致死锁）
@@ -264,6 +277,8 @@ async def create_publish_plan(
             raise BusinessException(ErrorCode.PUBLISH_TASK_IN_PROGRESS, get_msg("PUBLISH_TASK_IN_PROGRESS"))
     if existing_task:
         # 更新现有任务
+        # 记录修改前的计划时间，作为级联子内容时判断"子级是否被单独修改过"的基准
+        old_scheduled_time = existing_task.scheduled_time
         logger.info(
             f"[更新发布计划] task_id={existing_task.id}, 原 scheduled_time={existing_task.scheduled_time}, "
             f"新 scheduled_time={data.scheduled_time}"
@@ -279,7 +294,8 @@ async def create_publish_plan(
         existing_task.updated_by = user_id
         task = await publish_repository.update_publish_task(db, existing_task)
     else:
-        # 创建新任务
+        # 创建新任务（首次设置，无旧计划时间基准）
+        old_scheduled_time = None
         task = PublishTask(
             entity_type=data.entity_type,
             entity_id=data.entity_id,
@@ -352,6 +368,7 @@ async def create_publish_plan(
             task_type=data.task_type,
             execution_mode=data.execution_mode,
             scheduled_time=data.scheduled_time,
+            parent_old_scheduled_time=old_scheduled_time,
             user_id=user_id,
             ignore_child_status=data.cascade_ignore_status,
             processed_by=processed_by,
@@ -431,9 +448,32 @@ async def update_publish_plan(
             )
     else:
         # 修改计划时间
+        old_scheduled_time = task.scheduled_time
         task.execution_mode = data.execution_mode
         task.scheduled_time = data.scheduled_time
         await publish_repository.update_publish_task(db, task)
+
+        # 修改父级（或单季）计划时间后，级联同步仍跟随的子内容计划：
+        # - 仅发布计划级联（下架计划不级联子内容）
+        # - 基准比较保护被单独修改过计划时间的子内容（独立排期不被覆盖）
+        if (
+            task.entity_type == "Content"
+            and task.content_type
+            and task.task_type == "publish"
+            and task.status == "pending"
+            and data.scheduled_time is not None
+        ):
+            await _cascade_create_plan_for_children(
+                db,
+                content_id=task.entity_id,
+                content_type=task.content_type,
+                task_type="publish",
+                execution_mode="plan",
+                scheduled_time=data.scheduled_time,
+                parent_old_scheduled_time=old_scheduled_time,
+                ignore_child_status=True,  # 修改计划入口仅发布管理页使用
+                processed_by=processed_by,
+            )
 
     return PublishPlanResponse.model_validate(task)
 
@@ -648,11 +688,28 @@ async def batch_publish(
     # 则跳过该内容，因为父级发布时会级联发布子级，单独发布子级会因父级发布任务尚未完成
     # 导致 _validate_parent_published 校验失败。
     entity_ids_to_process = list(data.entity_ids)
+    # 计划发布模式下，被去重的子内容改为保留直接处理（显式勾选=重置其计划时间）
+    explicit_child_ids: set[int] = set()
     if data.entity_type == "Content" and data.task_type == "publish":
         entity_ids_to_process = await _filter_out_descendants_in_batch(db, list(data.entity_ids))
         if len(entity_ids_to_process) < len(data.entity_ids):
             skipped_ids = set(data.entity_ids) - set(entity_ids_to_process)
             logger.info(f"[batch_publish] 批量发布去重：跳过 {len(skipped_ids)} 个子内容（会被父级级联发布）| skipped_ids={skipped_ids}")
+            if data.execution_mode == "plan":
+                # 【计划发布】去重后子内容只依赖父级级联更新，但子内容可能因
+                # "独立排期保护"被级联跳过（保留旧计划时间），导致用户显式
+                # 勾选子内容的意图失效。此处将被跳过的子内容追加到列表末尾
+                # 直接处理（父级已在前序处理、计划已创建）：
+                # - 跳过父级已发布校验（父级计划在本批次已建立，执行顺序由
+                #   定时任务的父级状态守卫保证）
+                # - 立即发布不去重重加，避免子内容被级联+直接重复执行两次
+                explicit_child_ids = skipped_ids
+                entity_ids_to_process.extend(
+                    [i for i in data.entity_ids if i in skipped_ids]
+                )
+                logger.info(
+                    f"[batch_publish] 计划发布：保留 {len(skipped_ids)} 个显式勾选的子内容直接重置计划 | ids={explicit_child_ids}"
+                )
 
     for entity_id in entity_ids_to_process:
         entity_name = None
@@ -703,7 +760,12 @@ async def batch_publish(
         logger.info(f"[batch_publish] 准备创建发布计划 | entity_id={entity_id} | content_type={content_type} | execution_mode={data.execution_mode}")
 
         try:
-            result = await create_publish_plan(db, plan_data, user_id, processed_by=processed_by)
+            # 显式勾选的子内容（计划发布）：跳过"父级已发布"校验——
+            # 父级计划在本批次前序已创建，执行顺序由调度器父级状态守卫保证
+            result = await create_publish_plan(
+                db, plan_data, user_id, processed_by=processed_by,
+                _skip_parent_validation=entity_id in explicit_child_ids,
+            )
             results.append(BatchPublishResultItem(
                 entity_id=entity_id,
                 entity_name=entity_name,
@@ -1573,6 +1635,7 @@ async def _cascade_create_plan_for_children(
     task_type: str,
     execution_mode: str,
     scheduled_time: Optional[datetime] = None,
+    parent_old_scheduled_time: Optional[datetime] = None,
     user_id: Optional[int] = None,
     ignore_child_status: bool = False,
     processed_by: Optional[str] = None,
@@ -1594,10 +1657,18 @@ async def _cascade_create_plan_for_children(
         - 若子内容尚无发布任务记录，跳过该子内容及其子树（不创建新任务）
         - 下架计划：不级联处理子内容，子内容需要单独下架
         - CHANNEL 的节目单（Schedule）也遵循上述规则
+        - 独立排期保护（仅计划发布）：子内容已有生效计划且其计划时间与
+          "父级旧计划时间+1s"基准不一致，说明已被单独修改过（如延迟上线），
+          不再跟随父级，跳过不覆盖，按子内容自己的计划时间执行
 
     防死循环（硬性防护，任何场景生效）：
         - _visited：访问路径集合，子内容已在路径中说明出现环，立即终止
         - _depth：递归深度上限，超过强制终止
+
+    参数：
+        parent_old_scheduled_time: 父级修改前的计划时间。级联覆盖前用于
+            基准比较（子内容当前时间 == 父级旧时间+1s 视为"仍跟随父级"），
+            逐层递归时每层各自的 create_publish_plan 会捕获该层旧时间传入
     """
     # ── 硬性防护1：深度上限 ──
     if _depth > _MAX_PUBLISH_RECURSION_DEPTH:
@@ -1664,13 +1735,34 @@ async def _cascade_create_plan_for_children(
                 )
                 continue
 
+        # 独立排期保护（仅计划发布）：子内容已有生效计划且其计划时间与
+        # "父级旧时间+1s"基准不一致，说明子内容计划已被单独修改过
+        # （如延迟上线），不再跟随父级，跳过覆盖，按自己的计划时间执行
+        if (
+            execution_mode == "plan"
+            and existing_task.publish_status == "plan"
+            and existing_task.status == "pending"
+            and existing_task.scheduled_time is not None
+        ):
+            expected_time = (
+                parent_old_scheduled_time + timedelta(seconds=1)
+                if parent_old_scheduled_time is not None
+                else None
+            )
+            if existing_task.scheduled_time != expected_time:
+                logger.info(
+                    f"[级联计划] 子内容 #{child.id} ({child.content_type}) 计划时间 "
+                    f"{existing_task.scheduled_time} 与父级基准 {expected_time} 不一致"
+                    f"（独立排期），跳过覆盖"
+                )
+                continue
+
         # 先更新当前子内容的发布任务，再递归处理其子内容
         # 保证 Season → Series → Episode 的顺序
         # 定时发布时，子内容的 scheduled_time 比父内容晚 1 秒，
         # 确保定时扫描器先执行父内容再执行子内容
         child_scheduled_time = scheduled_time
         if execution_mode == "plan" and scheduled_time is not None:
-            from datetime import timedelta
             child_scheduled_time = scheduled_time + timedelta(seconds=1)
         data = PublishPlanCreate(
             entity_type="Content",
@@ -1683,7 +1775,10 @@ async def _cascade_create_plan_for_children(
             cascade_ignore_status=ignore_child_status,
         )
         try:
-            await create_publish_plan(db, data, user_id, processed_by=processed_by, _skip_parent_republish=True)
+            await create_publish_plan(
+                db, data, user_id, processed_by=processed_by,
+                _skip_parent_republish=True, _skip_parent_validation=True,
+            )
             logger.info(
                 f"[级联计划] 为子内容 #{child.id} ({child.content_type}) 更新{task_type}计划 | "
                 f"execution_mode={execution_mode}"
@@ -1810,6 +1905,55 @@ async def _validate_parent_published(
             ErrorCode.PARENT_NOT_PUBLISHED,
             get_msg("PARENT_NOT_PUBLISHED", name=parent.title or str(parent.id)),
         )
+
+
+async def is_parent_publish_ready(db: AsyncSession, content_id: int) -> bool:
+    """
+    校验子内容的父级是否满足"子内容可执行发布"条件（供定时任务执行时使用）。
+
+    规则：父级已发布（ObjectPublishStatus.is_published=True）
+          或父级当前任务正在发布中（publish_status=publishing）时返回 True。
+
+    与 _validate_parent_published 的区别：
+        - _validate_parent_published 在创建计划时调用，校验失败抛异常；
+        - 本函数在计划到期执行时调用（创建时的校验无法覆盖到期时点的
+          父级状态——父级计划可能失败/被取消），校验失败返回 False，
+          任务跳过本轮保持 pending，待父级发布成功后的下一轮扫描再执行，
+          避免向 LSP 发出没有父对象的子对象。
+    """
+    _CHILD_PARENT_MAP = {
+        "EPISODE": ("SERIES", "SEASON_SERIES"),
+        "SEASON_SERIES": ("SEASON",),
+        "SCHEDULE": ("CHANNEL",),
+    }
+
+    content = await publish_repository.get_content_by_id(db, content_id)
+    if not content or not content.parent_id:
+        return True
+
+    parent = await publish_repository.get_content_by_id(db, content.parent_id)
+    if not parent:
+        return True
+
+    valid_parent_types = _CHILD_PARENT_MAP.get(content.content_type)
+    if not valid_parent_types or parent.content_type not in valid_parent_types:
+        return True
+
+    # 父级已发布
+    publish_status = await publish_repository.get_object_publish_status(
+        db, "Content", parent.id
+    )
+    if publish_status and publish_status.is_published:
+        return True
+
+    # 父级正在发布中
+    parent_task = await publish_repository.get_entity_current_publish_status(
+        db, "Content", parent.id
+    )
+    if parent_task and parent_task.publish_status == "publishing":
+        return True
+
+    return False
 
 
 async def _sync_content_ingest_status(

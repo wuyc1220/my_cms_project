@@ -17,6 +17,7 @@ from app.internal.cms_biz_package.models.package import Content, ContentGenre
 from app.internal.cms_biz_package.services import task_service
 from app.internal.cms_biz_scp.models.trade import LicenseContent
 from app.internal.cms_biz_orchestration.models.episode_history import EpisodeHistory
+from app.common.core.i18n import get_msg
 from app.internal.cms_biz_orchestration.schemas.content import BatchImportItem, BatchImportResultItem
 from app.internal.cms_biz_orchestration.services import episode_history_service
 from app.internal.cms_biz_orchestration.services.workflow_service import complete_process_and_update_status, rollback_after_published_edit
@@ -107,17 +108,17 @@ async def batch_create_sub_contents(
         try:
             # 校验标题唯一性
             if item.title in existing_titles:
-                raise ValueError(f"名称已存在: {item.title}")
+                raise ValueError(get_msg("CONTENT_NAME_EXISTS"))
             existing_titles.add(item.title)
 
             # 校验序号唯一性
-            if ctype == "SERIES" and item.series_ordinal is not None:
+            if ctype in ("SERIES", "SEASON_SERIES") and item.series_ordinal is not None:
                 if item.series_ordinal in existing_ordinals:
-                    raise ValueError(f"季序号 {item.series_ordinal} 已存在")
+                    raise ValueError(get_msg("SERIES_ORDINAL_EXISTS"))
                 existing_ordinals.add(item.series_ordinal)
             elif ctype == "EPISODE" and item.sequence is not None:
                 if item.sequence in existing_ordinals:
-                    raise ValueError(f"集序号 {item.sequence} 已存在")
+                    raise ValueError(get_msg("EPISODE_SEQUENCE_EXISTS"))
                 existing_ordinals.add(item.sequence)
 
             # 创建 Content 记录（flush 获取 id，不提交）

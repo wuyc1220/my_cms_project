@@ -770,6 +770,31 @@ async def rollback_after_published_edit(
                 .values(is_deleted=True)
             )
 
+            # 审核中被编辑：提交动作需回退，ApplicationReview 重置为 Pending
+            # 让用户重新提交审核（与已发布回退行为一致，bug 32667）
+            latest_app_review = (
+                await db.execute(
+                    select(ContentProcess).where(
+                        ContentProcess.content_id == content_id,
+                        ContentProcess.node_code == "ApplicationReview",
+                        ContentProcess.is_deleted.is_(False),
+                    ).order_by(ContentProcess.created_at.desc()).limit(1)
+                )
+            ).scalar_one_or_none()
+            if latest_app_review is not None and latest_app_review.status != "Pending":
+                now = datetime.now()
+                db.add(ContentProcess(
+                    content_id=content_id,
+                    name="ApplicationReview",
+                    node_code="ApplicationReview",
+                    sequence=3,
+                    start_dt=now,
+                    status="Pending",
+                    end_dt=None,
+                    assigned=edited_by,
+                    info=get_msg("PROCESS_ROLLBACK_AFTER_EDIT", edit_info=edit_info),
+                ))
+
             logger.info(
                 "InProgress 内容编辑后清理评审记录 | content_id={}",
                 content_id,
@@ -777,7 +802,6 @@ async def rollback_after_published_edit(
 
         # 已发布过的内容再次编辑，且当前没有待审批的 ContentReview 时，
         # 重置 ApplicationReview 为 Pending，避免提交审核入口仍显示绿色✓。
-        # 存在 Pending ContentReview 时按规范只清理审核记录，不重置提交审核节点。
         if not existing_review:
             from app.internal.cms_biz_publish.repositories import publish_repository
 

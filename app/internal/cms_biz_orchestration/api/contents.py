@@ -768,6 +768,8 @@ async def get_import_template(
         content_type: 内容类型，支持 'EPISODE' 或 'SERIES'
     """
     from openpyxl import Workbook
+    from openpyxl.cell.rich_text import CellRichText, TextBlock
+    from openpyxl.cell.text import InlineFont
     from openpyxl.styles import Alignment, Font, PatternFill
 
     if content_type not in ("EPISODE", "SERIES", "SEASON_SERIES"):
@@ -780,28 +782,54 @@ async def get_import_template(
 
     if content_type == "EPISODE":
         ws.title = "Episodes"
-        headers = ["Episode Name", "Sequence", "Assignee"]
+        headers = ["Episode Name(*)", "Sequence(*)", "Assignee"]
         filename = "Episode_Import_Template.xlsx"
         example_data = [
             ["Episode 1", 1, "admin"],
             ["Episode 2", 2, "admin"],
         ]
-    else:  # SERIES
+        instructions = [
+            "Instructions",
+            "",
+            "1. Fields marked with a red (*) are required: Episode Name, Sequence.",
+            "2. Sequence must be a positive integer and must be unique within the parent series.",
+            "3. Assignee is optional. You can fill in the username (e.g. admin) or the user ID. Leave it blank if not needed.",
+            "4. Do not modify or delete the header row. Data starts from row 2.",
+        ]
+    else:  # SERIES / SEASON_SERIES
         ws.title = "Series"
-        headers = ["Series Name", "Series Ordinal", "Assignee"]
+        headers = ["Series Name(*)", "Series Ordinal(*)", "Assignee"]
         filename = "Series_Import_Template.xlsx"
         example_data = [
             ["Series 1", 1, "admin"],
             ["Series 2", 2, "admin"],
         ]
+        instructions = [
+            "Instructions",
+            "",
+            "1. Fields marked with a red (*) are required: Series Name, Series Ordinal.",
+            "2. Series Ordinal must be a positive integer and must be unique within the parent season.",
+            "3. Assignee is optional. You can fill in the username (e.g. admin) or the user ID. Leave it blank if not needed.",
+            "4. Do not modify or delete the header row. Data starts from row 2.",
+        ]
 
     # 表头样式
     header_fill = PatternFill(start_color="1677FF", end_color="1677FF", fill_type="solid")
     header_font = Font(color="FFFFFF", bold=True)
+    # 必填标记使用富文本：字段名白色 + (*) 红色
+    base_inline = InlineFont(rFont="Calibri", b=True, color="FFFFFF")
+    mark_inline = InlineFont(rFont="Calibri", b=True, color="FF0000")
 
     # 写入表头
     for col, header in enumerate(headers, 1):
-        cell = ws.cell(row=1, column=col, value=header)
+        cell = ws.cell(row=1, column=col)
+        if header.endswith("(*)"):
+            cell.value = CellRichText(
+                TextBlock(base_inline, header[:-3]),
+                TextBlock(mark_inline, "(*)"),
+            )
+        else:
+            cell.value = header
         cell.fill = header_fill
         cell.font = header_font
         cell.alignment = Alignment(horizontal="center", vertical="center")
@@ -812,9 +840,16 @@ async def get_import_template(
             ws.cell(row=row_idx, column=col_idx, value=value)
 
     # 设置列宽
-    col_widths = [30, 15, 20]
+    col_widths = [30, 18, 20]
     for col, width in enumerate(col_widths, 1):
         ws.column_dimensions[ws.cell(row=1, column=col).column_letter].width = width
+
+    # 填写说明页
+    notes_ws = wb.create_sheet("Instructions")
+    for row_idx, note in enumerate(instructions, 1):
+        notes_ws.cell(row=row_idx, column=1, value=note)
+    notes_ws.column_dimensions["A"].width = 100
+    notes_ws["A1"].font = Font(bold=True)
 
     # 保存到内存
     buf = io.BytesIO()

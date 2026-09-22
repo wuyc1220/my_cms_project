@@ -85,11 +85,24 @@ async def run_content_publish(db: AsyncSession) -> dict | None:
     succeeded = 0
     failed = 0
     exhausted = 0
+    skipped = 0
 
     for idx, task in enumerate(rows, 1):
         task_id = task.id
         logger.info(f"[ContentPublish] [{idx}/{len(rows)}] 处理任务 ID={task_id}, task_type={task.task_type}")
         logger.info(f"[ContentPublish] 任务状态={task.status}, 重试次数={task.retry_attempts}/{max_retry}")
+
+        # 子内容执行前校验父级发布状态：父级既未发布也不在发布中时跳过本轮
+        # （任务保持 pending 不计失败，待父级发布成功后的下一轮扫描再执行，
+        #   避免向 LSP 发出没有父对象的子对象；非子内容类型无父级，直接执行）
+        if task.entity_type == "Content" and task.task_type == "publish":
+            if not await publish_service.is_parent_publish_ready(db, task.entity_id):
+                skipped += 1
+                logger.info(
+                    f"[ContentPublish] [{idx}/{len(rows)}] 任务 ID={task_id} 父级未发布且不在发布中，"
+                    f"跳过等待下轮扫描"
+                )
+                continue
 
         try:
             logger.info(f"[ContentPublish] [{idx}/{len(rows)}] 开始执行发布任务 ID={task_id}")
@@ -134,8 +147,9 @@ async def run_content_publish(db: AsyncSession) -> dict | None:
         "succeeded": succeeded,
         "failed": failed,
         "exhausted": exhausted,
+        "skipped": skipped,
         "max_retry": max_retry,
     }
-    logger.info(f"[ContentPublish] 任务执行完成：triggered={len(rows)}, succeeded={succeeded}, failed={failed}, exhausted={exhausted}")
+    logger.info(f"[ContentPublish] 任务执行完成：triggered={len(rows)}, succeeded={succeeded}, failed={failed}, exhausted={exhausted}, skipped={skipped}")
     logger.info(f"[ContentPublish] ========== 任务结束 ==========")
     return summary

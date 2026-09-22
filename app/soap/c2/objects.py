@@ -588,12 +588,18 @@ def build_schedule_object(
         # meta.volume_count 是创建时写入的静态字段，常为 NULL 导致属性缺失
         vc = series_children_count if series_children_count is not None else meta.volume_count
         _add_property(obj, "VolumnCount", vc)
-        _add_property(obj, "Sequence", meta.sequence)
+        # Sequence 仅对连续剧单集（type=1/2）有意义；type=0 填了也不输出，
+        # 避免无关值污染 XML
+        if meta.series_type in (1, 2):
+            _add_property(obj, "Sequence", meta.sequence)
         # C2 规范：series 支持 PPV subscription 时，在 SeriesType 段输出 PackageID，
         # 表示订阅该服务包后可观看连续剧每集。与 PPVEnable 的 PackageID 属性含义不同。
         if meta.series_type and meta.series_type != 0 and series_package_ids:
             _add_property(obj, "PackageID", series_package_ids)
-        _add_property(obj, "SeriesOrdinal", meta.series_ordinal)
+        # SeriesOrdinal 仅对季播单集（type=2）有意义；type=1 填了也不输出
+        # （缺陷 32543：普通连续剧归档后节目单 XML 多出 SeriesOrdinal）
+        if meta.series_type == 2:
+            _add_property(obj, "SeriesOrdinal", meta.series_ordinal)
         _add_property(obj, "ShowID", _fmt_c2_id(meta.show_id, ElementType.SERIES))
         _add_i18n_property(obj, "ShowName", meta.show_name, i18n, "show_name", langs, primary_language)
         _add_property(obj, "CDR_ID", meta.cdr_id)

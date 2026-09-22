@@ -9,7 +9,6 @@
 - 内容-服务包关联：查询/新增/删除关联
 - 内容-栏目关联：查询/新增/删除关联
 - 流程/日志：查询流程、状态日志、活动日志
-
 未实现字段（模型尚无对应字段，返回 None 占位）：
 - cutv_enable（CUTV 启用）
 - archived（是否归档）
@@ -5913,6 +5912,14 @@ async def _process_archive_row(
             errors.append("Sequence is required when Series Type is 1 or 2")
         if series_type == 2 and series_ordinal is None:
             errors.append("Series Ordinal is required when Series Type is 2")
+        # 类型不匹配的字段清空：series_ordinal 仅对 type=2（季播）有意义，
+        # sequence 仅对 type=1/2（连续剧单集）有意义。
+        # 归档会把这些值覆盖写入节目单 schedule_metadata，若 type=1 仍透传
+        # series_ordinal，节目单再次发布时 XML 会多输出 <SeriesOrdinal>（缺陷 32543）
+        if series_type != 2:
+            series_ordinal = None
+        if series_type == 0:
+            sequence = None
         # 父类存在性校验（仅在必填校验通过后执行，避免误导性错误）
         if not errors and series_type == 1:
             _parent = (

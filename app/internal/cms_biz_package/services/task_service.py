@@ -14,6 +14,7 @@ from loguru import logger
 from sqlalchemy import select, delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.common.utils.log_enricher import orm_to_dict, prepare_log_values
 from app.internal.cms_biz_package.models.task import Task, TaskHistory
 from app.internal.cms_biz_package.models.package import Content
 from app.internal.cms_biz_system.models.user import User
@@ -28,6 +29,10 @@ from app.internal.cms_biz_package.schemas.task import (
 from app.internal.cms_biz_package.repositories import task_repo
 from app.common.schemas import PaginatedResponse
 from app.common.core.i18n import get_msg
+from app.internal.cms_biz_system.services.operation_log_service import (
+    OperationType,
+    write_log,
+)
 from app.common.core.exceptions import NotFoundException, BusinessException, ErrorCode
 
 
@@ -380,8 +385,14 @@ async def batch_assign_tasks(
     assignee_id: int,
     update_childs: bool = False,
     processed_by: str | None = None,
+    processed_by_id: int | None = None,
+    ip_address: str | None = None,
 ) -> int:
-    """批量分配任务，返回成功分配数量（自动跳过已完成任务）。"""
+    """批量分配任务，返回成功分配数量（自动跳过已完成任务）。
+
+    为每个成功分配的任务写入独立的 OperationLog，确保各任务详情页的
+    Processed History 都能正确展示（bug 32668）。
+    """
     tasks = await task_repo.get_tasks_by_ids(db, task_ids)
     assigned_count = 0
 
@@ -389,6 +400,7 @@ async def batch_assign_tasks(
         if task.task_status == "Completed":
             continue
 
+        old_data = orm_to_dict(task)
         old_assignee_id = task.assignee_id
         old_assignee_name = await _get_user_name(db, task.assignee_id)
         new_assignee_name = await _get_user_name(db, assignee_id)
@@ -397,6 +409,8 @@ async def batch_assign_tasks(
         if task.task_status == "Not Assigned":
             task.task_status = "Pending"
         await db.flush()
+        await db.refresh(task)
+        new_data = orm_to_dict(task)
 
         await task_repo.add_task_history(
             db,
@@ -408,6 +422,25 @@ async def batch_assign_tasks(
                 updated_value=f"Assignee: {new_assignee_name or ''}",
             ),
         )
+
+        # 每个任务独立写 OperationLog，避免批量日志只挂在第一个 task 上
+        prev_val, new_val, raw_val = await prepare_log_values(db, "task", old_data, new_data)
+        await write_log(
+            db,
+            user_id=processed_by_id,
+            user_name=processed_by or "system",
+            operation_type=OperationType.TASK_ASSIGN,
+            operation_object_code="OBJ_TASK", operation_object_params={"name": task.id},
+            operation_content_code="LOG_TASK_ASSIGN", operation_content_params={"id": task.id, "assignee": task.assignee_id},
+            previous_value=prev_val,
+            updated_value=new_val,
+            updated_value_json=raw_val,
+            entity_type="task",
+            entity_id=task.id,
+            ip_address=ip_address,
+            result="success",
+        )
+
         await _ensure_content_auth(db, task.content_id, assignee_id)
         # 移除旧负责人的任务指派授权（仅限 role_id 为空的用户授权，不影响角色授权）
         if old_assignee_id is not None and old_assignee_id != assignee_id:

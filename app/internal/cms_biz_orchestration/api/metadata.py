@@ -243,7 +243,8 @@ async def create_series_metadata(
     data_dict = data.model_dump()
     data_dict["content_id"] = content_id
     result = await metadata_service.create_series_metadata(
-        db, SeriesMetadataCreate(**data_dict), processed_by=current_user.username
+        db, SeriesMetadataCreate(**data_dict), processed_by=current_user.username,
+        actor_id=current_user.id, ip_address=_get_ip(request),
     )
     new_data = orm_to_dict(result, "series_metadata")
     prev_val, upd_val, raw_val = await prepare_log_values(db, "series_metadata", None, new_data)

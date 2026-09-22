@@ -204,6 +204,10 @@ class SeriesMetadataBase(BaseModel):
 class SeriesMetadataCreate(SeriesMetadataBase):
     """创建 Series 元数据请求体。"""
     content_id: int
+    # Update Childs 控制开关（创建时可直接触发子级同步，避免前端 create+update 连调产生重复流程记录）
+    update_childs_main: Optional[bool] = False  # Main 标签：元数据字段
+    update_childs_custom_fields: Optional[bool] = False  # Custom Fields 标签：自定义字段
+    update_childs_i18n: Optional[bool] = False  # Multi Languages 标签：多语言字段
 
 
 class SeriesMetadataUpdate(BaseModel):

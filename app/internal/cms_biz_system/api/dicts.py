@@ -15,6 +15,7 @@ from app.internal.cms_biz_system.services.dict_service import (
     toggle_status,
     update_node,
     _to_response,
+    _invalidate_dict_caches,
 )
 from app.internal.cms_biz_system.services.operation_log_service import OperationType, write_log
 from app.common.utils.log_enricher import prepare_log_values, orm_to_dict
@@ -88,6 +89,7 @@ async def create_dict_node(
         entity_id=node.id,
     )
     await db.commit()
+    _invalidate_dict_caches()
     return node
 
 
@@ -120,6 +122,7 @@ async def update_dict_node(
         entity_id=node_id,
     )
     await db.commit()
+    _invalidate_dict_caches()
     return node
 
 
@@ -153,6 +156,7 @@ async def update_dict_node_status(
         entity_id=node_id,
     )
     await db.commit()
+    _invalidate_dict_caches()
     return {"id": node.id, "status": node.status}
 
 
@@ -184,4 +188,5 @@ async def delete_dict_node(
         entity_id=node_id,
     )
     await db.commit()
+    _invalidate_dict_caches()
     return {"success": True}

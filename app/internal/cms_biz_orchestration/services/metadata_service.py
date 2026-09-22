@@ -276,7 +276,9 @@ async def get_series_metadata(db: AsyncSession, content_id: int) -> SeriesMetada
 
 @transactional
 async def create_series_metadata(
-    db: AsyncSession, data: SeriesMetadataCreate, processed_by: str | None = None
+    db: AsyncSession, data: SeriesMetadataCreate, processed_by: str | None = None,
+    actor_id: int | None = None,
+    ip_address: str | None = None,
 ) -> SeriesMetadataItem:
     """创建 Series 元数据。"""
     content = await _get_content_or_404(db, data.content_id)
@@ -297,6 +299,10 @@ async def create_series_metadata(
     # )
 
     dump = data.model_dump()
+    # 提取 Update Childs 开关（不保存到元数据表，仅用于创建后触发子级同步）
+    update_childs_main = dump.pop("update_childs_main", False)
+    update_childs_custom_fields = dump.pop("update_childs_custom_fields", False)
+    update_childs_i18n = dump.pop("update_childs_i18n", False)
     if not dump.get("name"):
         dump["name"] = content.title
     # 自动生成 CDR ID: Series_{content_id}
@@ -316,7 +322,23 @@ async def create_series_metadata(
         for gid in genre_ids:
             db.add(ContentGenre(content_id=data.content_id, genre_id=gid))
 
-    # 用户主动创建元数据弹窗，直接记 Passed（用户确认即完成）
+    await db.flush()
+
+    # Update Childs：创建时可直接触发子级同步（避免前端 create+update 连调产生两条父级流程记录）
+    if update_childs_main or update_childs_custom_fields or update_childs_i18n:
+        logger.info(
+            "创建 Series 元数据并触发 Update Childs 同步 | content_id={} main={} custom={} i18n={}",
+            data.content_id, update_childs_main, update_childs_custom_fields, update_childs_i18n,
+        )
+        await _sync_series_to_children(
+            db, data.content_id,
+            update_childs_main, update_childs_custom_fields, update_childs_i18n,
+            processed_by,
+            actor_id=actor_id,
+            ip_address=ip_address,
+        )
+
+    # 用户主动创建元数据弹窗，直接记 Passed（用户确认即完成；无论是否同步子级，父级只写这一条流程记录）
     await complete_process_and_update_status(
         db,
         content_id=data.content_id,
@@ -326,6 +348,8 @@ async def create_series_metadata(
         record_status="Passed",
         info="创建 Series 元数据",
     )
+
+    await db.refresh(metadata)
 
     logger.info("创建 Series 元数据 | content_id={} type={}", data.content_id, content.content_type)
     return SeriesMetadataItem.model_validate(metadata)

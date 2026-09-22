@@ -7,7 +7,6 @@
 from datetime import date, timedelta
 from typing import Any
 
-from loguru import logger
 from sqlalchemy import func, select, case
 from sqlalchemy.ext.asyncio import AsyncSession
 import json
@@ -372,8 +371,6 @@ class DashboardStatService:
             visible_genres: 用户配置中可见的题材名称列表，为None时统计所有题材
             current_user: 当前用户，用于数据权限过滤
         """
-        logger.info(f"get_published_stats 入参: visible_genres={visible_genres}")
-
         base_query = select(Content).where(
             Content.status == "Published",
             Content.content_type.in_(["MOVIE", "SEASON", "SEASON_SERIES", "SERIES"]),
@@ -455,14 +452,12 @@ class DashboardStatService:
 
         result = await self.db.execute(genre_query)
         genre_counts = {row[0]: row[1] for row in result.all()}
-        logger.info(f"get_published_stats 题材统计原始结果: {genre_counts}")
 
         # 确保所有可见题材都出现在结果中（没有数据的显示为0）
         by_genre = [
             PieDataItem(name=name, value=genre_counts.get(name, 0))
             for name in (visible_genres or [])
         ]
-        logger.info(f"get_published_stats 题材统计最终结果: {by_genre}")
 
         ingest_status_query = (
             select(Content.status, func.count(Content.id))
@@ -862,10 +857,6 @@ class DashboardStatService:
             )
             if item.get("code")
         ]
-        logger.info(f"get_dashboard_data 用户 {user_id} 的可见题材: {visible_genres}")
-        logger.info(f"get_dashboard_data 用户 {user_id} 的可见状态: {visible_statuses}")
-        logger.info(f"get_dashboard_data 用户配置: {config.content_genre_config}")
-
         can_see_task = current_user is not None and await has_task_permission(self.db, current_user)
 
         task_completion_stats = await self.get_task_completion_stats() if can_see_task else TaskCompletionStatsResponse(

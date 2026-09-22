@@ -121,10 +121,6 @@ async def _build_license_info(db: AsyncSession, content_id: int) -> tuple[int, O
 
 async def _get_custom_tags(db: AsyncSession, content_id: int) -> tuple[list[int], list[str]]:
     """查询内容关联的自定义标签 ID 列表和名称列表。"""
-    from loguru import logger
-    
-    logger.info(f"[_get_custom_tags] 查询 content_id={content_id} 的自定义标签")
-    
     rows = (
         await db.execute(
             select(ContentCustomTag.custom_tag_id, CustomTag.name)
@@ -132,11 +128,7 @@ async def _get_custom_tags(db: AsyncSession, content_id: int) -> tuple[list[int]
             .where(ContentCustomTag.content_id == content_id, CustomTag.is_deleted.is_(False))
         )
     ).all()
-    
-    logger.info(f"[_get_custom_tags] content_id={content_id} 查询结果: {len(rows)} 条记录")
-    for row in rows:
-        logger.info(f"[_get_custom_tags]   - custom_tag_id={row.custom_tag_id}, name={row.name}")
-    
+
     ids = [r.custom_tag_id for r in rows]
     names = [r.name for r in rows]
     return ids, names
@@ -566,6 +558,41 @@ async def check_content_title_unique(
         raise BusinessException(ErrorCode.CONTENT_NAME_EXISTS, get_msg("CONTENT_NAME_EXISTS"))
 
 
+async def _inherit_licenses_from(
+    db: AsyncSession,
+    source_content_id: int,
+    target_content_id: int,
+) -> None:
+    """将源内容未删除的许可证关联复制到目标内容（幂等跳过或恢复已存在关联）。"""
+    source_license_ids = (
+        await db.execute(
+            select(LicenseContent.license_id).where(
+                LicenseContent.content_id == source_content_id,
+                LicenseContent.is_deleted.is_(False),
+            )
+        )
+    ).scalars().all()
+    if not source_license_ids:
+        return
+
+    existing_rows = (
+        await db.execute(
+            select(LicenseContent).where(
+                LicenseContent.content_id == target_content_id,
+                LicenseContent.license_id.in_(source_license_ids),
+            )
+        )
+    ).scalars().all()
+    existing_map = {row.license_id: row for row in existing_rows}
+
+    for lid in source_license_ids:
+        lic = existing_map.get(lid)
+        if lic is None:
+            db.add(LicenseContent(license_id=lid, content_id=target_content_id))
+        elif lic.is_deleted:
+            lic.is_deleted = False
+
+
 async def create_content(db: AsyncSession, data: ContentCreate, processed_by: str | None = None) -> ContentListItem:
     """
     新建内容。
@@ -678,6 +705,16 @@ async def create_content(db: AsyncSession, data: ContentCreate, processed_by: st
 
     main_content.external_id = str(main_content.id)
 
+    # ── 继承父内容许可证 ─────────────────────────────────────────
+    # 必须在自动创建子节点之前完成，子节点才能从本节点继续继承；
+    # 且全部在函数中段的第一次 commit 之前完成，避免后续步骤异常导致继承丢失
+    if data.parent_id and ctype in (
+        ContentType.SEASON_SERIES.value,
+        ContentType.SERIES.value,
+        ContentType.EPISODE.value,
+    ):
+        await _inherit_licenses_from(db, data.parent_id, main_content.id)
+
     # ── 自动创建子节点（SERIES → EPISODE）───────────────────────────
     if ctype in (ContentType.SERIES.value, ContentType.SEASON_SERIES.value) and data.volumn_count and data.volumn_count > 0:
         from app.internal.cms_biz_orchestration.models.episode_history import EpisodeHistory
@@ -692,6 +729,9 @@ async def create_content(db: AsyncSession, data: ContentCreate, processed_by: st
             db.add(ep)
             await db.flush()
             ep.external_id = str(ep.id)
+
+            # 继承父节点许可证
+            await _inherit_licenses_from(db, main_content.id, ep.id)
 
             # 记录 EpisodeHistory
             db.add(EpisodeHistory(
@@ -732,6 +772,9 @@ async def create_content(db: AsyncSession, data: ContentCreate, processed_by: st
 
             series_child.external_id = str(series_child.id)
 
+            # 继承父节点（SEASON）许可证
+            await _inherit_licenses_from(db, main_content.id, series_child.id)
+
             for seq in range(1, detail.episode_count + 1):
                 ep = Content(
                     content_type=ContentType.EPISODE.value,
@@ -743,6 +786,9 @@ async def create_content(db: AsyncSession, data: ContentCreate, processed_by: st
                 db.add(ep)
                 await db.flush()
                 ep.external_id = str(ep.id)
+
+                # 继承父节点（SEASON_SERIES）许可证
+                await _inherit_licenses_from(db, series_child.id, ep.id)
 
             # 为 SEASON_SERIES 子节点记录 InjectSubContent 流程状态并更新内容状态
             # 单季下已创建 EPISODE 子节点，状态应从 None 变为 InProgress
@@ -976,40 +1022,7 @@ async def create_content(db: AsyncSession, data: ContentCreate, processed_by: st
                 )
     
     # ── 继承父内容许可证 ─────────────────────────────────────────
-    # 新建子内容时，自动继承父内容的许可证关联（跳过已存在关联，含软删除记录）
-    if data.parent_id and ctype in (
-        ContentType.SEASON_SERIES.value,
-        ContentType.SERIES.value,
-        ContentType.EPISODE.value,
-    ):
-        parent_license_ids = (
-            await db.execute(
-                select(LicenseContent.license_id).where(
-                    LicenseContent.content_id == data.parent_id,
-                    LicenseContent.is_deleted.is_(False),
-                )
-            )
-        ).scalars().all()
-        if parent_license_ids:
-            existing_license_ids = set(
-                (
-                    await db.execute(
-                        select(LicenseContent.license_id).where(
-                            LicenseContent.content_id == main_content.id,
-                        )
-                    )
-                ).scalars().all()
-            )
-            added_license_ids: list[int] = []
-            for lid in parent_license_ids:
-                if lid in existing_license_ids:
-                    continue
-                db.add(LicenseContent(license_id=lid, content_id=main_content.id))
-                added_license_ids.append(lid)
-            if added_license_ids:
-                logger.info(
-                    f"继承父内容 #{data.parent_id} 许可证: {added_license_ids} → 子内容 #{main_content.id}"
-                )
+    # 已提前至创建子节点之前执行（见函数前段），此处无需重复处理
 
     await db.commit()
 

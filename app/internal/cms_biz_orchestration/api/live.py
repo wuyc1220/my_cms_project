@@ -1241,18 +1241,19 @@ async def submit_content_review_api(
     )
     is_approve = body.review_type == "approve"
     op_type = OperationType.CONTENT_REVIEW_APPROVE if is_approve else OperationType.CONTENT_REVIEW_REJECT
-    reject_reason = body.description if not is_approve and body.description else None
+    description = body.description or ""
     upd_val_dict = {
         "review_type": body.review_type,
         "review_level": body.review_level,
+        "description": description,
     }
-    if reject_reason:
-        upd_val_dict["reason"] = reject_reason
+    if not is_approve and description:
+        upd_val_dict["reason"] = description
     upd_val = json.dumps(upd_val_dict, ensure_ascii=False, default=str)
     op_content_kwargs = (
-        {"operation_content_code": "log.review.approve"}
+        {"operation_content_code": "log.review.approve", "operation_content_params": {"description": description}}
         if is_approve
-        else {"operation_content_code": "log.review.reject", "operation_content_params": {"reason": reject_reason or ""}}
+        else {"operation_content_code": "log.review.reject", "operation_content_params": {"reason": description}}
     )
     await write_log(
         db,
