@@ -198,8 +198,8 @@ class FTPStorageBackend(StorageBackend):
     
     def _connect(self):
         """建立 FTP 连接"""
-        from ftplib import FTP
-        ftp = FTP()
+        from ftplib import FTP  # nosec B402 风险已接受（理由见 _download_from_url）
+        ftp = FTP()  # nosec B321
         ftp.connect(settings.file_host, settings.file_port)
         ftp.login(settings.file_username, settings.file_password)
         if settings.ftp_passive_mode:
@@ -529,8 +529,10 @@ class StorageService:
                 transport.close()
 
         elif parsed.scheme == "ftp":
-            from ftplib import FTP
-            ftp = FTP()
+            # FTP 为外部源站附件回源的必要兼容协议（协议由第三方决定，无法单方面
+            # 换用 SFTP/FTPS），明文传输风险已评估并接受（见告警 dismiss 记录）
+            from ftplib import FTP  # nosec B402
+            ftp = FTP()  # nosec B321
             try:
                 ftp.connect(host, port)
                 ftp.login(username, password)
@@ -555,7 +557,9 @@ class StorageService:
                 cred = base64.b64encode(f"{username}:{password}".encode()).decode()
                 req.add_header("Authorization", f"Basic {cred}")
             try:
-                with urllib.request.urlopen(req, timeout=120) as resp:
+                # 分支 scheme 白名单（仅 http/https 到达此处）已拦截 file:// 等危险 scheme，
+                # urlopen 无需再审计 scheme，Bandit B310 静默处理
+                with urllib.request.urlopen(req, timeout=120) as resp:  # nosec B310
                     return resp.read()
             except Exception as e:
                 logger.error(

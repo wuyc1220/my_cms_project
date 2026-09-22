@@ -861,9 +861,9 @@ def _ftp_download(
     remote_path: str, timeout: int,
 ) -> bytes:
     """同步 FTP 下载（在线程池中执行）"""
-    from ftplib import FTP
+    from ftplib import FTP  # nosec B402 风险已接受（理由见 storage.py _download_from_url）
     from io import BytesIO
-    ftp = FTP()
+    ftp = FTP()  # nosec B321
     ftp.connect(host, port, timeout=timeout)
     try:
         ftp.login(username, password)

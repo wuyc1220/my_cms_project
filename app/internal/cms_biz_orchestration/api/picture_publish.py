@@ -8,7 +8,7 @@
 - 创建 IngestHistory 记录
 """
 from datetime import datetime, timezone
-from xml.dom import minidom
+from defusedxml.minidom import parseString as defused_parse_string
 from xml.etree.ElementTree import Element, SubElement, tostring
 
 import uuid
@@ -71,7 +71,7 @@ def _build_picture_only_root() -> Element:
 def _serialize(root: Element) -> str:
     """序列化 XML 并添加声明"""
     rough = tostring(root, encoding="unicode")
-    reparsed = minidom.parseString(rough.encode("utf-8"))
+    reparsed = defused_parse_string(rough.encode("utf-8"))
     return reparsed.toprettyxml(indent="  ", encoding="utf-8").decode("utf-8")
 
 

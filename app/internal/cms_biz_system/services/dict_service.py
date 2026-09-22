@@ -34,11 +34,15 @@ def _invalidate_dict_caches() -> None:
     _dict_children_cache.clear()
 
 
-async def _fix_sequence(db: AsyncSession, table_name: str, sequence_name: str) -> None:
-    result = await db.execute(text(f"SELECT MAX(id) FROM {table_name}"))
+async def _fix_sequence(db: AsyncSession) -> None:
+    """修复 dict_id_seq 序列（主键冲突回填自增起点）。
+
+    SQL 内联字面量表名/序列名、数值走绑定参数，杜绝动态拼接（Bandit B608）。
+    """
+    result = await db.execute(text("SELECT MAX(id) FROM dict"))
     max_id = result.scalar() or 0
-    await db.execute(text(f"SELECT setval('{sequence_name}', {max_id + 1}, false)"))
-    logger.warning(f"序列 {sequence_name} 已自动修复为 {max_id + 1}")
+    await db.execute(text("SELECT setval('dict_id_seq', :new_id, false)"), {"new_id": max_id + 1})
+    logger.warning(f"序列 dict_id_seq 已自动修复为 {max_id + 1}")
 
 
 async def get_node(db: AsyncSession, node_id: int) -> DictNode:
@@ -251,7 +255,7 @@ async def create_node(db: AsyncSession, data: DictNodeCreate) -> DictNode:
     except IntegrityError as e:
         if "dict_pkey" in str(e) or "UniqueViolation" in str(e):
             await db.rollback()
-            await _fix_sequence(db, "dict", "dict_id_seq")
+            await _fix_sequence(db)
             db.add(node)
             await db.flush()
         else:

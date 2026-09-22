@@ -13,7 +13,7 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
-from xml.dom import minidom
+from defusedxml.minidom import parseString as defused_parse_string
 from xml.etree.ElementTree import Element, SubElement, tostring
 
 from loguru import logger
@@ -428,5 +428,5 @@ class PackageSyncBuilder:
 def _serialize(root: Element) -> str:
     """将 Element 序列化为带 XML 声明、缩进美化的字符串"""
     raw = tostring(root, encoding="utf-8")
-    pretty = minidom.parseString(raw).toprettyxml(indent="  ", encoding="utf-8")
+    pretty = defused_parse_string(raw).toprettyxml(indent="  ", encoding="utf-8")
     return pretty.decode("utf-8")

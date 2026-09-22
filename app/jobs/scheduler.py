@@ -73,7 +73,7 @@ def _task_lock_id(task_type: str) -> int:
     - 同一个 task_type 在所有 Python 进程/实例中产生相同的 lock ID
     - 不同 task_type 之间互不阻塞（各自持有独立的锁）
     """
-    return int(hashlib.md5(task_type.encode()).hexdigest()[:16], 16) & 0x7FFFFFFFFFFFFFFF
+    return int(hashlib.md5(task_type.encode(), usedforsecurity=False).hexdigest()[:16], 16) & 0x7FFFFFFFFFFFFFFF
 
 
 _SCHEDULER_TZ = app_tz
